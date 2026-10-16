@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>科研 Agent 系统</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/research-guide.css" />
+</head>
+<body>
+<div class="app">
+    <!-- 左侧导航 -->
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h1 class="sidebar-title">科研 Agent 系统</h1>
+            <div class="sidebar-subtitle">Scientific Research Assistant</div>
+        </div>
+        <nav class="nav" id="nav">
+            <div class="nav-section">项目</div>
+            <div class="nav-item" data-page="dashboard">
+                <span>项目总览</span>
+            </div>
+            <div class="nav-item" data-page="create">
+                <span>新建与管理</span>
+            </div>
+            <div class="nav-section">研究过程</div>
+            <div class="nav-item" data-page="topic-discovery">
+                <span>选题探索</span>
+                <span class="nav-badge muted" id="badge-topic-discovery" style="display:none">!</span>
+            </div>
+            <div class="nav-item" data-page="papers">
+                <span>文献库</span>
+                <span class="nav-badge muted" id="badge-papers" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="research-report">
+                <span>研究现状</span>
+                <span class="nav-badge muted" id="badge-report-gaps" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="gaps">
+                <span>研究问题</span>
+                <span class="nav-badge muted" id="badge-gaps" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="experiments">
+                <span>方案与实验</span>
+                <span class="nav-badge muted" id="badge-experiments" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="writing">
+                <span>成果写作</span>
+                <span class="nav-badge muted" id="badge-writing" style="display:none">0</span>
+            </div>
+            <div class="nav-section">任务与记录</div>
+            <div class="nav-item" data-page="progress">
+                <span>任务进度</span>
+                <span class="nav-badge muted" id="badge-progress" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="notes">
+                <span>灵感笔记</span>
+                <span class="nav-badge muted" id="badge-notes" style="display:none">0</span>
+            </div>
+            <div class="nav-item" data-page="human">
+                <span>待确认事项</span>
+                <span class="nav-badge" id="badge-human" style="display:none">!</span>
+            </div>
+            <div class="nav-section">使用指南</div>
+            <div class="nav-item" data-page="methods">
+                <span>研究指南</span>
+            </div>
+        </nav>
+        <div class="sidebar-download" id="sidebar-download" style="display:none">
+            <div class="sidebar-download-head">
+                <span class="sidebar-download-title">📥 快速下载</span>
+            </div>
+            <select class="sidebar-download-fmt" id="sidebar-download-fmt">
+                <option value="md">Markdown (.md)</option>
+                <option value="docx">Word (.docx)</option>
+                <option value="pdf">PDF (.pdf)</option>
+            </select>
+            <div class="sidebar-download-list" id="sidebar-download-list"></div>
+        </div>
+        <div class="sidebar-notes" id="sidebar-notes" style="display:none">
+            <div class="sidebar-notes-head">
+                <span class="sidebar-notes-title">科研灵感记录</span>
+                <span class="sidebar-notes-link" id="sidebar-note-link">全部 →</span>
+            </div>
+            <textarea class="sidebar-notes-input" id="sidebar-note-input"
+                placeholder="随时记录灵感、质疑或下一步方向…（Ctrl+Enter 提交）" rows="3"></textarea>
+            <button class="sidebar-notes-btn" id="sidebar-note-save">记录灵感</button>
+            <div class="sidebar-notes-list" id="sidebar-notes-list"></div>
+        </div>
+        <div class="sidebar-footer">
+            研究辅助 · 人工判断 · 证据留存
+        </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <div class="main">
+        <header class="topbar">
+            <div class="topbar-breadcrumb" id="topbar-breadcrumb">
+                <span class="breadcrumb-root" id="breadcrumb-root">科研 Agent 系统</span>
+                <span class="breadcrumb-sep">›</span>
+                <span class="breadcrumb-current" id="topbar-title">项目总览</span>
+            </div>
+            <div class="topbar-spacer"></div>
+            <div class="topbar-status" id="topbar-status" style="display:none">
+                <span class="topbar-status-dot"></span>
+                <span id="topbar-status-text">运行中</span>
+            </div>
+            <div class="topbar-project" id="topbar-project">
+                <span class="topbar-project-label">当前项目</span>
+                <strong id="current-project-id">未创建</strong>
+            </div>
+            <button class="topbar-help" id="topbar-help" title="查看快捷键与帮助">?</button>
+            <button class="btn guide-toggle" id="research-guide-toggle" aria-controls="research-guide" aria-expanded="true">科研指导</button>
+        </header>
+        <div class="research-layout" id="research-layout">
+        <section class="research-main" aria-label="项目工作区">
+        <!-- 流程导航条：独立容器，不被页面内容 clear 影响（灵感笔记页隐藏） -->
+        <div class="flow-nav-host" id="flow-nav-host"></div>
+        <main class="content" id="content">
+            <!-- 由 app.js 渲染 -->
+            <div class="loading">加载中…</div>
+        </main>
+        </section>
+        <aside id="research-guide" class="research-guide" aria-label="科研指导">
+            <div class="rg-heading"><div><span class="rg-kicker">RESEARCH COPILOT</span><h2>科研指导</h2></div><button id="rg-close" class="rg-icon" aria-label="收起科研指导" title="收起科研指导">×</button></div>
+            <p class="rg-description">围绕当前项目讨论，保留你的研究判断。</p>
+            <div class="rg-context"><span id="rg-page">总览</span><span id="rg-mode">准备就绪</span></div>
+            <div class="rg-tabs" role="tablist" aria-label="科研指导内容">
+                <button id="rg-chat-tab" role="tab" aria-selected="true" aria-controls="rg-chat">项目对话</button>
+                <button id="rg-records-tab" role="tab" aria-selected="false" aria-controls="rg-records">研究记录</button>
+            </div>
+            <section id="rg-chat" class="rg-chat" role="tabpanel" aria-labelledby="rg-chat-tab">
+                <div id="rg-starters" class="rg-starters"></div>
+                <details class="rg-materials"><summary>对话参考材料 <span id="rg-material-count"></span></summary><div id="rg-materials"></div></details>
+                <div class="rg-thread-tools"><button id="rg-refresh" type="button">刷新材料</button><button id="rg-latest" type="button">最新对话 ↓</button></div>
+                <div id="rg-messages" class="rg-messages" role="log" aria-label="项目对话记录" aria-live="polite" tabindex="0"></div>
+                <div id="rg-error" class="rg-error" role="status" hidden></div>
+                <form id="rg-form" class="rg-form">
+                    <label for="rg-input" class="rg-sr-only">向科研指导提问</label>
+                    <textarea id="rg-input" maxlength="6000" rows="3" placeholder="讨论当前方向、论文，或下一步怎么做…"></textarea>
+                    <div class="rg-compose-footer"><span>Ctrl / ⌘ + Enter</span><button id="rg-send" type="submit" class="btn">发送</button></div>
+                </form>
+            </section>
+            <section id="rg-records" class="rg-records" role="tabpanel" aria-labelledby="rg-records-tab" hidden></section>
+        </aside>
+        </div>
+    </div>
+</div>
+
+<!-- 全局 loading 遮罩 -->
+<div class="loading-overlay" id="loading-overlay" style="display:none">
+    <div class="loading-overlay-content">
+        <div class="loading-spinner"></div>
+        <div class="loading-overlay-text" id="loading-overlay-text">处理中…</div>
+    </div>
+</div>
+
+<!-- 快捷键与帮助面板 -->
+<div class="help-panel" id="help-panel" style="display:none">
+    <div class="help-panel-content">
+        <div class="help-panel-head">
+            <h3>快捷键与使用提示</h3>
+            <button class="help-panel-close" id="help-panel-close">×</button>
+        </div>
+        <div class="help-panel-body">
+            <div class="help-section">
+                <div class="help-section-title">键盘快捷键</div>
+                <div id="help-navigation"></div>
+                <div class="help-row"><kbd>?</kbd> / <kbd>F1</kbd> - <span>打开本帮助</span></div>
+                <div class="help-row"><kbd>Esc</kbd> - <span>关闭弹窗</span></div>
+                <div class="help-row"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> - <span>提交灵感笔记/表单</span></div>
+            </div>
+            <div class="help-section">
+                <div class="help-section-title">使用流程</div>
+                <div class="help-flow">
+                    <span class="help-flow-step">1. 新建项目</span>
+                    <span class="help-flow-arrow">→</span>
+                    <span class="help-flow-step">2. 选题与阅读</span>
+                    <span class="help-flow-arrow">→</span>
+                    <span class="help-flow-step">3. 明确问题并验证</span>
+                    <span class="help-flow-arrow">→</span>
+                    <span class="help-flow-step">4. 整理成果</span>
+                </div>
+            </div>
+            <div class="help-section">
+                <div class="help-section-title">产物下载</div>
+                <p class="help-note">左侧「快速下载」保留已有产物导出；新保存的研究记录可在「成果写作」导出。没有生成的产物不会因此自动生成。</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/research-navigation.js"></script>
+<script src="/static/research-guide.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,258 @@
+"""research 阶段节点 IO schema 定义。
+
+调研阶段全流程（借鉴 PaperQA + GPT-Researcher）：
+    用户给定研究主题
+    → 主题精炼（生成关键词与查询策略）
+    → 子问题分解（GPT-Researcher：拆为 5-10 个子问题用于并行检索）
+    → 用户确认
+    → 论文抓取（按子问题并行检索 arxiv/S2）
+    → 相关性筛选（PaperQA filter：打分+筛选）
+    → 论文入库（chunk 摘要 + 向量入库）
+    → 交叉验证（GPT-Researcher：多源冲突可信度评分）
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from core.orchestration.node import NodeInput, NodeOutput
+
+
+# ===== TopicRefineAgent =====
+
+class TopicRefineInput(NodeInput):
+    """主题精炼输入。"""
+
+    topic: str
+
+
+class TopicRefineOutput(NodeOutput):
+    """主题精炼输出：检索关键词与查询策略。"""
+
+    keywords: list[str]
+    query_strategy: str
+
+
+# ===== SubqueryDecomposeAgent（借鉴 GPT-Researcher）=====
+
+class SubqueryDecomposeInput(NodeInput):
+    """子问题分解输入。
+
+    借鉴 GPT-Researcher：把研究主题拆为多个子问题，便于并行检索与信息聚合。
+    """
+
+    topic: str
+    keywords: list[str]
+    query_strategy: str = ""
+
+
+class SubqueryDecomposeOutput(NodeOutput):
+    """子问题分解输出：5-10 个子问题。
+
+    每个子问题应当是可独立检索的、覆盖主题不同侧面的。
+    """
+
+    subqueries: list[str]
+    # 子问题对应的检索意图（便于 fetch 阶段选择数据源）
+    intents: list[str] = []
+
+
+# ===== TopicConfirmHuman =====
+
+class TopicConfirmOutput(NodeOutput):
+    """用户确认检索方向后的输出。"""
+
+    confirmed: bool
+    refined_topic: str
+    # 用户可修订子问题列表
+    refined_subqueries: list[str] = []
+
+
+# ===== PaperFetchAgent =====
+
+class PaperFetchInput(NodeInput):
+    """论文抓取输入。"""
+
+    keywords: list[str]
+    query_strategy: str = ""
+    subqueries: list[str] = []
+
+
+class PaperFetchOutput(NodeOutput):
+    """论文抓取输出：论文元数据列表 + 检索证据链。
+
+    每条元数据是 dict，含 title/authors/year/abstract/arxiv_id/source_subquery 等字段。
+    source_subquery 标记该候选来自哪个子问题的检索（便于后续交叉验证）。
+
+    evidence_chain 是审计轨迹（证据链要求）：每条记录一次检索命中，
+    含 subquery / source / title / external_id(doc_id|arxiv_id|s2_id) /
+    offset / evidence_score / snippet，由 PaperIngestAgent 落库并关联 paper_id。
+    """
+
+    paper_metas: list[dict[str, Any]]
+    evidence_chain: list[dict[str, Any]] = []
+
+
+# ===== PaperRelevanceFilterAgent（借鉴 PaperQA filter）=====
+
+class PaperRelevanceFilterInput(NodeInput):
+    """相关性筛选输入。
+
+    借鉴 PaperQA：对候选论文做相关性打分与筛选，过滤低质量/离题候选。
+    """
+
+    topic: str
+    subqueries: list[str]
+    paper_metas: list[dict[str, Any]]
+
+
+class PaperRelevanceFilterOutput(NodeOutput):
+    """相关性筛选输出：保留高相关性候选，附相关性分数与理由。
+
+    每条带 relevance_score（0~1）与 reason。
+    """
+
+    filtered_paper_metas: list[dict[str, Any]]
+    # 被剔除的候选（含 reason，便于人工追溯）
+    rejected: list[dict[str, Any]] = []
+
+
+# ===== PaperIngestAgent =====
+
+class PaperIngestInput(NodeInput):
+    """论文入库输入。"""
+
+    paper_metas: list[dict[str, Any]]
+
+
+class PaperIngestOutput(NodeOutput):
+    """论文入库输出：入库后的 paper_id 列表。"""
+
+    paper_ids: list[str]
+
+
+# ===== CrossValidateAgent（借鉴 GPT-Researcher）=====
+
+class CrossValidateInput(NodeInput):
+    """交叉验证输入。
+
+    借鉴 GPT-Researcher：对入库 chunk 做多源信息冲突检测与交叉验证，
+    输出可信度评分与冲突处置建议。
+
+    注入 topic 是为了避免下游 LLMs 拿到与主题无关的子问题（修复串主题 bug），
+    也是为结构化 Gap 提供「研究主题」上下文，让 gap_text 更聚焦于该主题。
+    """
+
+    topic: str = ""
+    paper_ids: list[str] = []
+    subqueries: list[str] = []
+
+
+class CrossValidateOutput(NodeOutput):
+    """交叉验证输出：可信度报告。
+
+    report 结构（结构化版，「Research Gap 识别质量」硬要求）：
+    {
+        "conflicts": [
+            {
+                "claim": "冲突陈述",
+                "sources": [{"paper_id": "...", "chunk_id": "...", "stance": "support/refute"}, ...],
+                "resolution": "采纳来源/标记存疑/需进一步检索",
+                "confidence": 0.0~1.0,
+                "source_paper_ids": ["paper_id", ...],
+                "subquery": "子问题",
+            },
+            ...
+        ],
+        "consensus": [
+            {
+                "statement": "共识陈述",
+                "source_paper_ids": ["paper_id", ...],
+                "confidence": 0.0~1.0,
+                "subquery": "子问题",
+            },
+            ...
+        ],
+        "gaps": [
+            {
+                "gap": "结构化 Gap 陈述（聚焦材料领域具体空白）",
+                "type": "underexplored | contradiction | missing_connection | method_gap | data_gap",
+                "importance": 0.0~1.0,
+                "actionability": "high | medium | low",
+                "cited_paper_ids": ["paper_id", ...],   # 证据链：paper_id
+                "cited_chunk_ids": ["chunk_id", ...],   # 证据链：chunk_id
+                "rationale": "为什么这是 Gap、为何对材料领域有价值",
+                "subquery": "归属子问题",
+            },
+            ...
+        ],
+        "overall_confidence": 0.0~1.0,
+    }
+    """
+
+    report: dict[str, Any]
+
+
+# ===== MaterialKnowledgeExtractionAgent（Task 2：材料-性能-合成三元组）=====
+
+class MaterialExtractionInput(NodeInput):
+    """领域知识抽取输入：从入库论文摘要中抽取三元组。"""
+
+    paper_ids: list[str]
+
+
+class MaterialExtractionOutput(NodeOutput):
+    """领域知识抽取输出：结构化领域知识（三元组）。
+
+    materials: [{name, formula, crystal_structure, space_group, lattice_parameters,
+                 symmetry, composition, paper_id, paper_title, confidence,
+                 source_snippet}]
+    properties: [{material_name, property_name, property_name_cn, value, value_num,
+                  unit, condition, paper_id, confidence, source_snippet}]
+    synthesis: [{material_name, method, precursors, temperature, pressure,
+                 atmosphere, duration, steps, paper_id, confidence, source_snippet}]
+    """
+
+    materials: list[dict[str, Any]] = []
+    properties: list[dict[str, Any]] = []
+    synthesis: list[dict[str, Any]] = []
+
+
+# ===== ResearchGapIdentifyAgent（Task 3：研究缺口识别）=====
+
+class ResearchGapInput(NodeInput):
+    """研究缺口识别输入。
+
+    双通道：
+    - 通道 A（LLM）：cross_validate 报告（gaps/conflicts/consensus）+
+      论文摘要 + 领域知识 → 语义级识别矛盾/未探索/断链
+    - 通道 B（数据驱动）：KnowledgeStore 材料库统计规则 →
+      有性能无合成 / 材料体系零覆盖 / 孤立材料 / 性能类别稀疏
+    """
+
+    paper_ids: list[str]
+    subqueries: list[str]
+    cross_validation_report: dict[str, Any] = {}
+
+
+class ResearchGapOutput(NodeOutput):
+    """研究缺口识别输出：结构化 Gap 清单。
+
+    gaps: [
+        {
+            "gap_id": "gap_xxx",
+            "gap_type": "contradiction | unexplored | missing_link",
+            "statement": "一句话陈述",
+            "detail": "详细说明",
+            "evidence": [{"paper_id", "title", "snippet"}, ...],  # 证据链，可溯源
+            "related_materials": ["SnSe", ...],
+            "actionability": "high | medium | low",
+            "priority": 1~5,          # 1 最高
+            "source": "llm | data_driven | hybrid",
+            "suggested_actions": ["补充实验", ...],
+            "subquery": "关联子问题",
+        },
+        ...
+    ]
+    """
+
+    gaps: list[dict[str, Any]] = []
