@@ -79,6 +79,9 @@ _cleanup_*.py
 _cmp_repo_kaijie/
 _cmp_work/
 
+# Python package entry points must not match the temporary _*.py rule
+!__init__.py
+
 # Local assistant state, temporary test directories and private notes
 .workbuddy/
 .pytest*/
