@@ -14,6 +14,13 @@
         methodTab: "reading",
         workspaceCounts: null,
         workspaceCountsProjectId: null,
+        badgesProjectId: null,
+        notesCount: null,
+        reportGapsCount: null,
+        reportCountLoadingPid: null,
+        recordEditorIntent: null,
+        pendingRecordId: null,
+        publishedResearchFocus: null,
         statusCache: null,
         pollTimer: null,
         pollViewFingerprint: null, // 轮询内容不变时不重建页面，避免滚动条回位
@@ -460,9 +467,10 @@
         }
         node.style.display = "flex";
         node.className = "topbar-status";
+        node.title = "后台任务状态，不表示科研结论已经验证或项目全部完成";
         let cls = "", text = "";
         if (status === "running" || status === "in_progress") { cls = "running"; text = "运行中"; }
-        else if (status === "completed") { cls = "completed"; text = "已完成"; }
+        else if (status === "completed") { cls = "completed"; text = "任务已结束"; }
         else if (status === "failed" || status === "blocked") { cls = "failed"; text = "失败"; }
         else if (status === "pending_human" || status === "pending_review") { cls = "pending"; text = "等待人工"; }
         else if (status === "experiment_failed") { cls = "failed"; text = "实验失败"; }
@@ -521,6 +529,21 @@
     }
 
     function updateProjectIdDisplay() {
+        // 切换项目先清空旧统计，避免新请求返回前显示上一项目的数字。
+        if (state.badgesProjectId !== state.currentProjectId) {
+            state.badgesProjectId = state.currentProjectId;
+            state.notesCount = null;
+            state.reportGapsCount = null;
+            state.recordEditorIntent = null;
+            state.pendingRecordId = null;
+            state.publishedResearchFocus = null;
+            state.workspaceCounts = null;
+            state.workspaceCountsProjectId = null;
+            if (state.statusCache?.project_id !== state.currentProjectId) state.statusCache = null;
+            document.querySelectorAll(".nav-badge").forEach(node => {
+                node.style.display = "none"; node.textContent = ""; node.removeAttribute("title");
+            });
+        }
         document.getElementById("current-project-id").textContent =
             state.currentProjectId || "未创建";
         publishGuideContext();
@@ -562,12 +585,18 @@
             if (pid !== state.currentProjectId) return;
             const prevPending = state.statusCache?.pending_human;
             state.statusCache = data;
+            if (data.notes_count != null) state.notesCount = data.notes_count;
+            if (data.counts?.report_gaps != null) state.reportGapsCount = data.counts.report_gaps;
+            else refreshReportBadgeCount(pid); // 兼容尚未重启升级的服务，不以全部缺口数冒充报告问题数。
             updateBadges(data);
             updateTopbarStatus(data.status);
+            window.dispatchEvent(new CustomEvent("sra:project-status",{detail:{projectId:pid}}));
             const curPending = data.pending_human;
             if (!prevPending && curPending) {
                 showToast("有任务需要确认，请前往「待确认事项」处理", "warning");
             }
+            // 约束编辑期间仍接收后台状态，但不重建页面覆盖未保存的草稿。
+            if(document.querySelector('.project-brief-form[data-dirty="true"]')) {renderFlowNav();return;}
             if (state.currentPage === "progress" || state.currentPage === "topic-discovery") {
                 const fingerprint = JSON.stringify({
                     status: data.status, summary: data.summary, error: data.error,
@@ -596,20 +625,38 @@
         }
     }
 
+    async function refreshReportBadgeCount(pid) {
+        if (state.reportCountLoadingPid === pid) return;
+        state.reportCountLoadingPid = pid;
+        try {
+            const data = await api("GET", `/api/projects/${pid}/research-report`);
+            if (pid !== state.currentProjectId || data.error) return;
+            state.reportGapsCount = (data.report?.gaps || []).length;
+            updateBadges(state.statusCache || {});
+        } catch (_) { /* 暂时失败时保留已知统计，不把未知当作零。 */ }
+        finally { if (state.reportCountLoadingPid === pid) state.reportCountLoadingPid = null; }
+    }
+
     function updateBadges(data) {
+        if (data.project_id && data.project_id !== state.currentProjectId) return;
         const counts = data.counts || {};
         const records = state.workspaceCountsProjectId === state.currentProjectId ? state.workspaceCounts : null;
+        const count = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
         setBadge("badge-papers", counts.papers);
         setBadge("badge-gaps", records ? records.question : null);
-        setBadge("badge-report-gaps", counts.gaps);
+        setBadge("badge-report-gaps", counts.report_gaps ?? state.reportGapsCount);
         setBadge("badge-claims", counts.claims);
-        setBadge("badge-experiments", records ? records.plan + records.result + (counts.experiments || 0) : counts.experiments);
+        setBadge("badge-experiments", records ? count(records.plan) + count(records.result) + count(counts.experiments) : counts.experiments);
         setBadge("badge-writing", records ? records.outline : null);
         const questionsBadge = document.getElementById("badge-gaps");
         if (questionsBadge) questionsBadge.title = `已保存且无需复核的问题：${records?.question || 0}；文献待核实线索：${counts.gaps || 0}；原论断：${counts.claims || 0}`;
         const experimentsBadge = document.getElementById("badge-experiments");
         if (experimentsBadge) experimentsBadge.title = `方案：${records?.plan || 0}；实际结果记录：${records?.result || 0}；原实验记录：${counts.experiments || 0}（计数不表示实验成功）`;
-        setBadge("badge-notes", (data.notes_count != null) ? data.notes_count : null);
+        setBadge("badge-notes", state.notesCount ?? data.notes_count ?? null);
+        const reportBadge = document.getElementById("badge-report-gaps");
+        if (reportBadge) reportBadge.title = "研究现状报告中的候选问题数（不等于全部研究缺口数）";
+        const notesBadge = document.getElementById("badge-notes");
+        if (notesBadge) notesBadge.title = "当前项目保存的灵感笔记总数";
         setBadge("badge-human", data.pending_human ? "!" : null);
     }
 
@@ -802,6 +849,9 @@
             state.dashboardCache = data;
             clear(content);
             content.appendChild(el("div", {class:"page-header"}, [el("h2", {class:"page-title"}, "项目总览"), el("p", {class:"page-desc"}, "集中查看当前项目的任务状态与已有材料，点击研究路径进入对应页面。") ]));
+            const workspaceData=api("GET",`/api/projects/${state.currentProjectId}/workspace`);
+            renderProjectManagement(content,workspaceData);
+            renderResearchFlow(content,workspaceData);
 
             // 顶部状态横幅
             content.insertAdjacentHTML("beforeend",
@@ -2098,6 +2148,9 @@
     function renderProgress(content) {
         const data = state.statusCache;
         content.appendChild(el("div", {class:"page-header"}, [el("h2", {class:"page-title"}, "任务进度"), el("p", {class:"page-desc"}, "查看后台任务、失败原因与待确认事项。任务完成不等于研究结论成立；浏览已有材料不会取消正在运行的任务。") ]));
+        const workspaceData=api("GET",`/api/projects/${state.currentProjectId}/workspace`);
+        renderProjectManagement(content,workspaceData);
+        renderResearchFlow(content,workspaceData);
         if (!data) {
             content.appendChild(el("div", { class: "loading" }, "加载中…"));
             pollStatus();
@@ -3030,7 +3083,7 @@
 
     // ===== 研究过程：复用原页面与知识库，不另建一套导航或复制数据 =====
 
-    const RECORD_LABELS = {question:"研究问题", plan:"研究方案", result:"实际结果", finding:"研究判断", outline:"写作提纲"};
+    const RECORD_LABELS = {note:"灵感记录", question:"研究问题", plan:"研究方案", result:"实际结果", finding:"研究判断", outline:"写作提纲"};
     const RECORD_HINTS = {
         question:"描述具体场景、现有方法的限制、你想验证的问题。标明依据；尚未查证的创新点请写成假设。",
         plan:"写清数据、基线、改变的条件、评价指标、资源预算，以及什么结果支持或不支持设想。",
@@ -3082,6 +3135,220 @@
         if(tab==="writing") renderWritingMethod(panel); else renderReadingMethod(panel);
     }
 
+    const RECORD_PAGES = {question:"gaps", plan:"experiments", result:"experiments", finding:"experiments", note:"notes", outline:"writing"};
+    function readResearchFocus(pid) {
+        try { const value=JSON.parse(localStorage.getItem(`sra.research-focus.${pid}`) || "{}"); return value && typeof value==="object" ? value : {}; }
+        catch (_) { return {}; }
+    }
+    function rememberResearchFocus(pid,focus) {
+        try { localStorage.setItem(`sra.research-focus.${pid}`,JSON.stringify(focus)); } catch (_) { /* 本次选择仍可用。 */ }
+    }
+    function recordFormIsDirty() {
+        return !!document.querySelector('.research-record-form[data-dirty="true"]');
+    }
+    function openResearchRecord(item) {
+        if(item.kind==="note") {discussRecord(state.currentProjectId,item.item_id,`请围绕已保存的笔记「${item.title}」检查它与当前研究的关系。`);return;}
+        const existing=document.querySelector(`[data-record-id="${CSS.escape(item.item_id)}"]`);
+        if(existing) {existing.open=true;existing.scrollIntoView({block:"nearest"});return;}
+        if(recordFormIsDirty()) {showToast("当前记录尚未保存，请先保存或取消输入再跳转。","warning");return;}
+        state.pendingRecordId=item.item_id;
+        if(item.kind==="question") state.questionTab="questions";
+        setActivePage(RECORD_PAGES[item.kind] || "gaps");
+    }
+    function startResearchRecord(kind,relatedId=null,revision=null) {
+        if(recordFormIsDirty()) {showToast("当前记录尚未保存，请先保存或取消输入。","warning");return;}
+        state.recordEditorIntent={pid:state.currentProjectId,kind,relatedId,revision};
+        if(kind==="question") state.questionTab="questions";
+        setActivePage(RECORD_PAGES[kind] || "gaps");
+    }
+    function renderProjectManagement(content,workspaceData) {
+        const pid=state.currentProjectId;
+        if(!pid || !window.SRA_PROJECT_MANAGEMENT) return;
+        const box=el("section",{class:"card project-management","aria-label":"项目管理"},el("p",{class:"muted small"},"正在整理项目目标与已有工作…"));
+        content.appendChild(box);
+        Promise.resolve(workspaceData).then(data=>{
+            if(pid!==state.currentProjectId || !box.isConnected) return;
+            const workspace=data.workspace, baseline={goal:"",background:"",resources:"",time_budget:"",...workspace.brief};
+            box.replaceChildren(el("h3",{class:"card-title"},"项目管理"));
+            const summary=el("div");box.appendChild(summary);
+            const editor=el("details",{class:"project-brief-editor"},el("summary",{},"编辑目标与资源"));
+            const form=el("form",{class:"project-brief-form"});
+            const inputs={};
+            const labels={goal:"研究目标",background:"已有基础",resources:"可用资源",time_budget:"时间安排"};
+            const placeholders={goal:"例如：本学期完成一个范围明确的研究问题与对照验证",background:"已有论文、代码、知识或已完成的工作",resources:"设备、数据、可用代码，以及暂时无法取得的资源",time_budget:"例如：六周内完成，每周约八小时"};
+            for(const field of Object.keys(labels)) {
+                const input=el("textarea",{rows:field==="time_budget" ? 2 : 3,maxLength:field==="time_budget" ? 1000 : 2000,"aria-label":labels[field],placeholder:placeholders[field]});
+                input.value=baseline[field];inputs[field]=input;
+                form.appendChild(el("label",{},[labels[field],input]));
+            }
+            const draftKey=`sra.project-brief.draft.${pid}`;
+            const notice=el("p",{class:"small",role:"status"});
+            let restoredBaseChanged=false;
+            try {
+                const draft=JSON.parse(sessionStorage.getItem(draftKey) || "null");
+                if(draft?.values && Object.keys(inputs).every(field=>typeof draft.values[field]==="string")) {
+                    for(const field of Object.keys(inputs)) inputs[field].value=draft.values[field].slice(0,inputs[field].maxLength);
+                    form.dataset.dirty="true";editor.open=true;
+                    restoredBaseChanged=JSON.stringify(draft.baseBrief)!==JSON.stringify(baseline);
+                    notice.textContent=restoredBaseChanged ? "已恢复未保存草稿；服务器上的项目约束也已变化，请逐项核对后再保存。" : "已恢复本次浏览器会话的草稿，尚未保存到项目。";
+                }
+            } catch (_) { /* 草稿不可用时仍可正常编辑。 */ }
+            const values=()=>Object.fromEntries(Object.entries(inputs).map(([field,input])=>[field,input.value.trim()]));
+            const acknowledgment=el("input",{type:"checkbox","aria-label":"确认约束变更需复核"});
+            const requireReview=workspace.items.some(item=>item.status==="active" && item.kind!=="note");
+            acknowledgment.required=(requireReview || restoredBaseChanged) && JSON.stringify(values())!==JSON.stringify(baseline);
+            const warning=el("label",{class:"project-brief-confirm"},[acknowledgment,requireReview ? "我已核对约束变更。保存后，现有研究记录会标为待复核，旧内容不会删除，实验不会自动重跑。" : "我已核对服务器最新约束，确认以本次输入保存。"]);
+            warning.hidden=!(requireReview || restoredBaseChanged);
+            const submit=el("button",{type:"submit",class:"btn"},"保存项目约束");
+            const cancel=el("button",{type:"button",class:"btn btn-secondary",onclick:()=>{
+                for(const field of Object.keys(inputs)) inputs[field].value=baseline[field];
+                form.dataset.dirty="false";acknowledgment.checked=false;
+                acknowledgment.required=false;
+                try {sessionStorage.removeItem(draftKey);} catch (_) {}
+                notice.textContent="已放弃本次未保存修改。";editor.open=false;
+                if(state.currentPage==="progress") renderPage(true);
+            }},"取消本次修改");
+            form.addEventListener("input",()=>{
+                acknowledgment.required=(requireReview || restoredBaseChanged) && JSON.stringify(values())!==JSON.stringify(baseline);
+                if(JSON.stringify(values())===JSON.stringify(baseline)) {
+                    form.dataset.dirty="false";try {sessionStorage.removeItem(draftKey);} catch (_) {}
+                } else {
+                    form.dataset.dirty="true";
+                    try {sessionStorage.setItem(draftKey,JSON.stringify({values:values(),baseBrief:baseline}));} catch (_) {}
+                }
+            });
+            form.addEventListener("submit",async event=>{
+                event.preventDefault();
+                const brief=values();
+                if(JSON.stringify(brief)===JSON.stringify(baseline)) {notice.textContent="内容没有变化，无需保存；不会触发复核。";return;}
+                if((requireReview || restoredBaseChanged) && !acknowledgment.checked) {notice.textContent="请先确认约束变更对已有记录的影响。";return;}
+                submit.disabled=true;notice.textContent="正在保存项目约束…";
+                try {
+                    await api("PUT",`/api/projects/${pid}/workspace/brief`,{expected_revision:workspace.revision,brief});
+                    form.dataset.dirty="false";try {sessionStorage.removeItem(draftKey);} catch (_) {}
+                    window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid,source:"project-management"}}));
+                    if(pid===state.currentProjectId) {showToast("项目约束已保存；请留意需要复核的记录。","success");renderPage(true);}
+                } catch(error) {
+                    notice.textContent=`保存失败：${error.message}。输入已保留在本次浏览器会话中；刷新后请核对最新记录再提交。`;
+                    submit.disabled=false;
+                }
+            });
+            form.append(warning,notice,el("div",{class:"btn-row"},[submit,cancel]));
+            editor.appendChild(el("p",{class:"muted small"},"编辑期间不会被后台轮询覆盖。首次补填约束也遵循原有复核规则；不需要改变研究条件时可以保持原值。"));
+            editor.appendChild(form);box.appendChild(editor);
+            let lastManagementSignature=null;
+            function paintSummary(force=false) {
+                const status=state.statusCache?.project_id===pid ? state.statusCache : {};
+                const focus=readResearchFocus(pid);
+                const signature=JSON.stringify({status:status.status,error:status.error,experiments:status.counts?.experiments,focus,revision:workspace.revision});
+                if(!force && signature===lastManagementSignature) return;
+                lastManagementSignature=signature;
+                const info=window.SRA_PROJECT_MANAGEMENT.summarize(workspace,data.papers || [],status,focus);
+                summary.replaceChildren(el("p",{class:"project-goal"},baseline.goal || "尚未填写研究目标，可以先补充目标、时间与资源限制。"));
+                const states=el("div",{class:"project-state-grid"},[
+                    el("div",{},[el("span",{class:"muted small"},"科研推进状态"),el("strong",{},info.researchState)]),
+                    el("div",{},[el("span",{class:"muted small"},"后台任务状态"),el("strong",{},info.systemState)]),
+                ]);summary.appendChild(states);
+                const resources=el("p",{class:"muted small"},`时间：${baseline.time_budget || "未填写"}；资源：${baseline.resources || "未填写"}`);summary.appendChild(resources);
+                const inventory=info.inventory;
+                const materials=el("details",{class:"project-materials"},el("summary",{},`已有材料 · ${inventory.papers} 篇论文 · ${inventory.plans} 条方案 · ${inventory.results} 条结果记录`));
+                materials.append(el("p",{class:"muted small"},`研究问题 ${inventory.questions} 条；研究判断 ${inventory.findings} 条；待复核 ${inventory.needsReview} 条。结果记录由用户提交，不等于系统独立复算；论文入库不代表全文已读。`),el("p",{class:"muted small"},`原流程另有 ${inventory.legacyExperiments} 条实验记录，保留原入口，不与新记录相加当作独立实验数量。`));summary.appendChild(materials);
+                const blockers=el("details",{class:"project-blockers"},el("summary",{},`当前阻碍与待核对事项 ${info.blockers.length} 项`));
+                const list=el("ul");info.blockers.forEach(text=>list.appendChild(el("li",{},text)));
+                blockers.appendChild(list);if(info.systemError) blockers.appendChild(el("p",{class:"text-danger small"},`另有后台错误：${info.systemError}。运行错误与科研设想被反驳不是同一回事。`));
+                summary.append(el("p",{class:"project-current-blocker"},info.blockers[0] || "暂无自动识别的记录缺项，仍需人工核对证据与局限。"),blockers);
+                const taskKey=`sra.project-tasks.hidden.${pid}`;
+                let hidden=[];try {const value=JSON.parse(localStorage.getItem(taskKey)||"[]");if(Array.isArray(value)) hidden=value.filter(x=>typeof x==="string");} catch (_) {}
+                const tasks=el("div",{class:"project-next-tasks"},el("h4",{},"下一步任务"));
+                info.tasks.filter(task=>!hidden.includes(task.id)).forEach(task=>{
+                    const card=el("div",{class:"project-task"},[el("strong",{},task.title),el("p",{},task.text)]);
+                    const go=()=>{
+                        if(task.action==="brief") {editor.open=true;inputs.goal.focus();return;}
+                        if(task.action==="papers") {setActivePage("papers");return;}
+                        const next=info.flow.next;
+                        if(next.action==="create") startResearchRecord(next.kind,next.relatedId);
+                        else if(next.action==="revise") startResearchRecord(next.item.kind,null,next.item);
+                        else if(next.action==="select") document.querySelector('.research-flow-card select')?.focus();
+                        else discussRecord(pid,info.flow.question?.item_id || null,`请核对当前问题的结果依据与局限：${next.text}`);
+                    };
+                    const discuss=()=>discussRecord(pid,info.flow.question?.item_id || null,`我想调整下一步任务「${task.title}」。原建议：${task.text}。项目目标：${baseline.goal || "待明确"}；时间：${baseline.time_budget || "待明确"}；资源：${baseline.resources || "待明确"}。请先讨论，不直接启动任务。`);
+                    card.appendChild(el("div",{class:"btn-row"},[
+                        el("button",{class:"btn btn-secondary btn-sm",onclick:go},"去处理"),
+                        el("button",{class:"btn btn-secondary btn-sm",onclick:discuss},"讨论调整"),
+                        el("button",{class:"project-muted-button",title:"仅在本机隐藏这条建议，不代表任务已完成",onclick:()=>{hidden.push(task.id);try {localStorage.setItem(taskKey,JSON.stringify(hidden));} catch (_) {}paintSummary(true);}},"暂不提醒"),
+                    ]));tasks.appendChild(card);
+                });
+                if(hidden.length) tasks.appendChild(el("button",{class:"project-muted-button",onclick:()=>{try {localStorage.removeItem(taskKey);} catch (_) {}paintSummary(true);}},"恢复本机隐藏的建议"));
+                tasks.appendChild(el("p",{class:"muted small"},"处理按钮只打开现有入口，不自动保存记录或调用模型；暂不提醒只是本机偏好，不会消除阻碍或标记研究已完成。"));summary.appendChild(tasks);
+            }
+            box.refreshManagement=()=>paintSummary();
+            paintSummary();
+        }).catch(error=>{if(box.isConnected)box.replaceChildren(el("p",{class:"text-danger small"},`项目管理加载失败：${error.message}`));});
+    }
+    for(const eventName of ["sra:research-focus","sra:project-status"]) window.addEventListener(eventName,()=>{
+        document.querySelectorAll('.project-management').forEach(box=>box.refreshManagement?.());
+    });
+    function renderResearchFlow(content,knownData=null) {
+        const pid=state.currentProjectId;
+        if(!pid || !window.SRA_RESEARCH_FLOW) return;
+        const box=el("section",{class:"card research-flow-card","aria-label":"研究主线"},el("p",{class:"muted small"},"正在核对研究记录的关联…"));
+        content.appendChild(box);
+        let focus=readResearchFocus(pid);
+        const load=knownData ? Promise.resolve(knownData) : api("GET",`/api/projects/${pid}/workspace`);
+        load.then(data=>{
+            if(pid!==state.currentProjectId || !box.isConnected) return;
+            function paint() {
+                const flow=window.SRA_RESEARCH_FLOW.analyze(data.workspace,data.papers || [],focus);
+                box.replaceChildren(el("h3",{class:"card-title"},"研究主线"),el("p",{class:"muted small"},"按同一个问题核对方案、结果与判断。这里只检查记录衔接，不代表科学验证；不会启动或更改后台实验。当前选择用于记录整理和科研指导，不会替换后台任务主题。"));
+                const fields=el("div",{class:"research-flow-selectors"});
+                const question=el("select",{"aria-label":"当前研究问题"},el("option",{value:""},flow.questions.length ? "请选择本次推进的问题" : "尚无已保存的问题"));
+                flow.questions.forEach(item=>question.appendChild(el("option",{value:item.item_id},item.title+(item.needs_review ? "（待复核）" : ""))));
+                question.value=flow.question?.item_id || "";
+                question.onchange=()=>{
+                    if(recordFormIsDirty()) {question.value=flow.question?.item_id || "";showToast("请先保存当前记录，再切换研究问题。","warning");return;}
+                    focus={question:question.value,plan:""};rememberResearchFocus(pid,focus);paint();
+                };
+                fields.appendChild(el("label",{},["当前研究问题",question]));
+                if(flow.plans.length>1) {
+                    const plan=el("select",{"aria-label":"当前研究方案"},el("option",{value:""},"请选择当前方案，避免混用不同实验条件"));
+                    flow.plans.forEach(item=>plan.appendChild(el("option",{value:item.item_id},item.title+(item.needs_review ? "（待复核）" : ""))));
+                    plan.value=flow.plan?.item_id || "";
+                    plan.onchange=()=>{
+                        if(recordFormIsDirty()) {plan.value=flow.plan?.item_id || "";showToast("请先保存当前记录，再切换研究方案。","warning");return;}
+                        focus={question:flow.question.item_id,plan:plan.value};rememberResearchFocus(pid,focus);paint();
+                    };
+                    fields.appendChild(el("label",{},["当前研究方案",plan]));
+                }
+                box.appendChild(fields);
+                const steps=el("ol",{class:"research-flow-steps","aria-label":"研究记录衔接"});
+                flow.steps.forEach(step=>steps.appendChild(el("li",{class:step.count ? "has-record" : "missing-record"},[el("span",{class:"small"},step.label),el("strong",{},step.state)])));
+                box.appendChild(steps);
+                const next=el("div",{class:"research-flow-next"},[el("strong",{},"建议下一步"),el("p",{},flow.next.text)]);
+                if(flow.next.action==="create") next.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>startResearchRecord(flow.next.kind,flow.next.relatedId)},`补充${RECORD_LABELS[flow.next.kind]}`));
+                if(flow.next.action==="revise") next.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>startResearchRecord(flow.next.item.kind,null,flow.next.item)},"核对并修订记录"));
+                if(flow.question) next.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>discussRecord(pid,flow.question.item_id,`请围绕「${flow.question.title}」检查研究主线。当前记录状态：${flow.steps.map(x=>x.label+"："+x.state).join("；")}。${flow.next.text} 请区分已有证据、待验证设想和用户提交的结果，不启动实验。`)},"讨论当前问题"));
+                box.appendChild(next);
+                flow.issues.forEach(text=>box.appendChild(el("p",{class:"small text-warning"},text)));
+                const links=el("div",{class:"research-flow-links"});
+                [flow.question,flow.plan,...flow.validResults,...flow.findings].filter(Boolean).forEach(item=>links.appendChild(el("button",{class:"research-record-link",onclick:()=>openResearchRecord(item)},`${RECORD_LABELS[item.kind]}：${item.title}`)));
+                box.appendChild(links);
+                const pending=data.workspace.items.filter(item=>item.status==="active" && item.needs_review);
+                if(pending.length) {
+                    const review=el("details",{class:"research-flow-review"},el("summary",{},`待复核记录 ${pending.length} 条（未计作已衔接的工作）`));
+                    pending.forEach(item=>review.appendChild(el("button",{class:"research-record-link",onclick:()=>openResearchRecord(item)},`${RECORD_LABELS[item.kind]}：${item.title}`)));
+                    box.appendChild(review);
+                }
+                if(!data.workspace.items.length) box.appendChild(el("p",{class:"muted small"},"原流程的论文、方法文档和实验任务保留原入口；这里不会自动复制旧产物或将它们当作已确认的新记录。"));
+                const signature=`${pid}:${flow.question?.item_id || ""}`;
+                if(state.publishedResearchFocus!==signature) {
+                    state.publishedResearchFocus=signature;
+                    window.dispatchEvent(new CustomEvent("sra:research-focus",{detail:{projectId:pid,itemId:flow.question?.item_id || null,title:flow.question?.title || ""}}));
+                }
+            }
+            paint();
+        }).catch(error=>{if(box.isConnected) box.replaceChildren(el("p",{class:"text-danger small"},`研究主线加载失败：${error.message}`),el("button",{class:"btn btn-secondary btn-sm",onclick:()=>{box.remove();renderResearchFlow(content);}},"重试研究主线"));});
+    }
+
     function discussRecord(pid,itemId,message) {
         window.dispatchEvent(new CustomEvent("sra:discuss",{detail:{projectId:pid,itemId,message}}));
     }
@@ -3094,6 +3361,7 @@
             window.dispatchEvent(new CustomEvent("sra:workspace-loaded",{detail:{projectId:pid,counts:data.counts}}));
             clear(content);
             const workspace=data.workspace;
+            if(!kinds.includes("outline")) renderResearchFlow(content,data);
             const card=el("div",{class:"card research-records"},[
                 el("h3",{class:"card-title"},"已保存的"+kinds.map(k=>RECORD_LABELS[k]).join(" · ")),
                 el("p",{class:"muted small"},"这里汇集手动保存和对话中明确采纳的记录，未采纳的模型建议不会自动写入。保存不会启动后台任务，也不会把旧论断自动改成已验证。"),
@@ -3105,13 +3373,20 @@
             records.slice().reverse().forEach(item=>{
                 const stale=item.status!=="active" || item.needs_review;
                 const label=item.status!=="active" ? "历史版本" : item.needs_review ? "依据已变化，待复核" : "已保存，非独立核验";
-                const d=el("details",{class:"research-record"},[el("summary",{},`${RECORD_LABELS[item.kind]} · ${item.title}`),el("p",{class:stale ? "text-warning small" : "muted small"},label),el("p",{class:"research-record-text"},item.content)]);
+                const d=el("details",{class:"research-record","data-record-id":item.item_id},[el("summary",{},`${RECORD_LABELS[item.kind]} · ${item.title}`),el("p",{class:stale ? "text-warning small" : "muted small"},label),el("p",{class:"research-record-text"},item.content)]);
                 if(item.result_status) d.appendChild(el("p",{class:"small"},`运行状态：${({completed:"已完成",failed:"运行失败",inconclusive:"无法定论"})[item.result_status]}`));
                 if(item.metrics && Object.keys(item.metrics).length) d.appendChild(el("pre",{class:"code-block"},JSON.stringify(item.metrics,null,2)));
                 if(item.assessment) d.appendChild(el("p",{class:"small"},`用户判断：${({supports:"支持设想",refutes:"不支持设想",inconclusive:"无法定论"})[item.assessment]}`));
-                if(item.related_ids.length) d.appendChild(el("p",{class:"muted small"},"关联记录："+item.related_ids.map(id=>workspace.items.find(x=>x.item_id===id)?.title || id).join("；")));
-                if(item.paper_ids.length) d.appendChild(el("p",{class:"muted small"},"参考文献："+item.paper_ids.map(id=>data.papers.find(x=>x.paper_id===id)?.title || id).join("；")));
+                if(item.related_ids.length) {
+                    const related=el("div",{class:"research-flow-links small"},"关联记录：");
+                    item.related_ids.forEach(id=>{const target=workspace.items.find(x=>x.item_id===id);related.appendChild(target ? el("button",{class:"research-record-link",onclick:()=>openResearchRecord(target)},`${RECORD_LABELS[target.kind]}：${target.title}`) : el("span",{class:"text-warning"},`${id}（记录缺失）`));});d.appendChild(related);
+                }
+                if(item.paper_ids.length) {
+                    const sources=el("div",{class:"research-flow-links small"},"参考文献：");
+                    item.paper_ids.forEach(id=>sources.appendChild(el("button",{class:"research-record-link",onclick:()=>window.__sraGoPaper(id)},data.papers.find(x=>x.paper_id===id)?.title || `${id}（请核对来源）`)));d.appendChild(sources);
+                }
                 d.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>discussRecord(pid,item.item_id,`请结合已保存的「${item.title}」帮我检查依据和下一步。`)},"讨论这条记录"));
+                if(item.status==="active" && !kinds.includes("outline")) d.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>startResearchRecord(item.kind,null,item)},"修订这条记录"));
                 card.appendChild(d);
             });
             const editor=el("details",{class:"research-record-editor"});
@@ -3144,6 +3419,23 @@
             type.addEventListener("change",chooseType);chooseType();
             const message=el("p",{class:"small",role:"status"});
             const submit=el("button",{type:"submit",class:"btn"},"保存记录");
+            const intent=state.recordEditorIntent;
+            const revision=intent?.pid===pid && kinds.includes(intent.kind) ? intent.revision : null;
+            if(intent?.pid===pid && kinds.includes(intent.kind)) {
+                state.recordEditorIntent=null;editor.open=true;type.value=intent.kind;chooseType();
+                if(intent.relatedId && [...refs.options].some(option=>option.value===intent.relatedId)) refs.value=intent.relatedId;
+                if(revision) {
+                    title.value=revision.title;body.value=revision.content;
+                    if(revision.related_ids.length===1 && [...refs.options].some(option=>option.value===revision.related_ids[0])) refs.value=revision.related_ids[0];
+                    sources.querySelectorAll('input[name="paper"]').forEach(input=>{input.checked=revision.paper_ids.includes(input.value);});
+                    type.disabled=true;submit.textContent="保存修订版本";
+                    editor.querySelector("summary").textContent="修订研究记录（保留旧版本）";
+                    hint.textContent+=" 修订会保留旧记录，并把依赖旧版本的下游记录标为待复核；历史实验指标不自动复制。";
+                    if(revision.result_status) run.value=revision.result_status;
+                    const acknowledge=el("input",{type:"checkbox",required:true,"aria-label":"已核对修订依据"});
+                    form.appendChild(el("label",{class:"research-revision-confirm"},[acknowledge,"我已核对本次修订的依据和关联，知道下游记录需要重新复核。"]));
+                }
+            }
             form.append(type,hint,title,body,refsField,runField,metrics,assessmentField,sources,message,submit);
             form.addEventListener("input",()=>{form.dataset.dirty="true";});
             form.addEventListener("change",()=>{form.dataset.dirty="true";});
@@ -3153,22 +3445,31 @@
                     const item={kind:type.value,title:title.value.trim(),content:body.value.trim(),paper_ids:Array.from(form.querySelectorAll('input[name="paper"]:checked')).map(n=>n.value),related_ids:refs.value ? [refs.value] : []};
                     if(type.value==="result") {item.result_status=run.value;item.metrics=metrics.value.trim() ? JSON.parse(metrics.value) : {};}
                     if(type.value==="finding") item.assessment=assessment.value;
-                    await api("POST",`/api/projects/${pid}/workspace/items`,{expected_revision:workspace.revision,item});
+                    if(revision) item.supersedes_id=revision.item_id;
+                    const saved=await api("POST",`/api/projects/${pid}/workspace/items`,{expected_revision:workspace.revision,item});
+                    if(revision?.kind==="question") {
+                        const focus=readResearchFocus(pid);
+                        if(focus.question===revision.item_id || workspace.items.filter(i=>i.kind==="question" && i.status==="active").length===1) rememberResearchFocus(pid,{question:saved.workspace.items.at(-1).item_id,plan:""});
+                    }
                     form.dataset.dirty="false";
                     window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid,source:"form"}}));
                     if(state.currentProjectId===pid && content.isConnected) renderResearchRecords(content,kinds);
                 } catch(e) {message.textContent=`保存失败：${e.message}。输入已保留；版本冲突时请先复制输入，刷新记录后核对再提交。`;submit.disabled=false;}
             });
             editor.appendChild(form);card.appendChild(editor);content.appendChild(card);
+            if(state.pendingRecordId) {
+                const target=content.querySelector(`[data-record-id="${CSS.escape(state.pendingRecordId)}"]`);
+                if(target) {state.pendingRecordId=null;target.open=true;target.scrollIntoView({block:"nearest"});}
+            }
         } catch(e) {
             content.replaceChildren(el("div",{class:"status-banner danger"},`研究记录加载失败：${e.message}`),el("button",{class:"btn btn-secondary",onclick:()=>renderResearchRecords(content,kinds)},"重试加载记录"));
         }
     }
 
     window.addEventListener("sra:records-changed",event=>{
-        if(event.detail.projectId!==state.currentProjectId || event.detail.source==="form") return;
-        if(document.querySelector('.research-record-form[data-dirty="true"]')) {showToast("研究记录已更新，可保存当前输入后刷新查看。","success");return;}
-        if(["gaps","experiments","writing"].includes(state.currentPage)) renderPage(true);
+        if(event.detail.projectId!==state.currentProjectId || ["form","project-management"].includes(event.detail.source)) return;
+        if(document.querySelector('.research-record-form[data-dirty="true"], .project-brief-form[data-dirty="true"]')) {showToast("研究记录已更新，可保存当前输入后刷新查看。","success");return;}
+        if(["dashboard","progress","gaps","experiments","writing"].includes(state.currentPage)) renderPage(true);
     });
 
     function renderWriting(content) {
@@ -4423,7 +4724,8 @@
             const data = await api("GET", `/api/projects/${projectId}/notes`);
             if (requestId !== sidebarNotesRequest || projectId !== state.currentProjectId) return;
             const notes = (data.notes || []).slice().reverse().slice(0, 3);
-            setBadge("badge-notes", (data.notes || []).length || null);
+            state.notesCount = (data.notes || []).length;
+            updateBadges(state.statusCache || {});
             if (listEl) {
                 clear(listEl);
                 if (!notes.length) {
@@ -4711,8 +5013,7 @@
                 ]),
             ]));
 
-            // 更新侧边栏 badge（调研报告徽章独立 id，避免与研究缺口冲突）
-            setBadge("badge-report-gaps", (report.gaps || []).length || null);
+            // 导航统计只由统一状态更新，浏览报告不再覆盖菜单数字。
 
             // Research Gaps（最重要的产出）
             const gapsCard = el("div", { class: "card" });

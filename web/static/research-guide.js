@@ -9,7 +9,14 @@
     const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text) n.textContent = text; return n; };
     const area = () => (PAGES[s.page] || PAGES.dashboard)[1];
     const key = pid => `sra.guide.draft.${pid || "none"}`;
+    const guideImage = "/static/assets/research-guide.png";
     function error(text="") { $("rg-error").textContent=text; $("rg-error").hidden=!text; }
+    function messageAvatar() {
+        const avatar=el("span","rg-avatar rg-avatar-message"); avatar.setAttribute("aria-hidden","true");
+        avatar.append(el("span","rg-avatar-mark","研"));
+        const img=el("img"); img.src=guideImage; img.alt=""; img.decoding="async"; avatar.append(img);
+        return avatar;
+    }
     async function request(pid, suffix="", body) {
         const r = await fetch(`${BASE}/api/projects/${encodeURIComponent(pid)}/workspace${suffix}`, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
         const d = await r.json();
@@ -33,6 +40,9 @@
         return n;
     }
     function renderContext() {
+        const selected=s.data?.workspace.items.find(item=>item.item_id===s.selected);
+        $("rg-focus").hidden=!selected;
+        $("rg-focus").textContent=selected ? `讨论参考：${selected.title}（研究记录，非已验证结论）` : "";
         $("rg-page").textContent=(PAGES[s.page] || PAGES.dashboard)[0];
         $("rg-mode").textContent=s.busy ? "正在思考" : s.data ? s.data.guide_mode==="model" ? "模型已接入" : "规则指导" : s.pid ? "读取材料中" : "未选择项目";
         const starters=$("rg-starters"); starters.replaceChildren();
@@ -83,7 +93,11 @@
             const empty=el("div","rg-empty"); empty.append(el("strong","","在原来的研究流程中，随时讨论"),document.createTextNode(s.pid ? "可以问方向是否可行、论文如何理解，或下一步如何安排。对话不会替你启动任务、确认人工节点或修改研究结论。" : "先在原来的总览中选择项目，或新建项目。左侧导航和灵感笔记的用法保持不变。")); box.append(empty);
         }
         messages.forEach(m=>{
-            const card=el("article",`rg-message ${m.role}`); card.append(el("span","rg-message-label",`${m.role==="user" ? "你" : "科研指导"} · ${m.area==="literature" ? "文献阅读" : m.area==="question" ? "问题讨论" : m.area==="study" ? "方案与实验" : m.area==="writing" ? "成果写作" : "项目总览"}`),richText(m.content));
+            const card=el("article",`rg-message ${m.role}`);
+            const heading=el("div","rg-message-heading");
+            if(m.role==="assistant") heading.append(messageAvatar());
+            heading.append(el("span","rg-message-label",`${m.role==="user" ? "你" : "科研指导"} · ${m.area==="literature" ? "文献阅读" : m.area==="question" ? "问题讨论" : m.area==="study" ? "方案与实验" : m.area==="writing" ? "成果写作" : "项目总览"}`));
+            card.append(heading,richText(m.content));
             m.questions.forEach(q=>card.append(el("p","rg-message-question",q)));
             m.cited_paper_ids.forEach(id=>card.append(el("p","rg-message-source",`参考：${s.data.papers.find(p=>p.paper_id===id)?.title || id}`)));
             m.suggestion_ids.forEach(id=>{
@@ -111,6 +125,10 @@
         renderContext();
     });
     window.addEventListener("sra:records-changed",event=>{if(event.detail.projectId===s.pid) load();});
+    window.addEventListener("sra:research-focus",event=>{
+        if(event.detail.projectId!==s.pid) return;
+        s.selected=event.detail.itemId;renderContext();
+    });
     window.addEventListener("sra:discuss",event=>{
         if(event.detail.projectId!==s.pid) return;
         setOpen(true); setTab("chat");

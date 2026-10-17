@@ -705,7 +705,8 @@ def get_status(project_id: str) -> dict:
 
     # 产出物计数
     counts = {"papers": 0, "ideas": 0, "claims": 0, "experiments": 0, "evidence": 0,
-              "entities": 0, "properties": 0, "methods": 0, "gaps": 0}
+              "entities": 0, "properties": 0, "methods": 0, "gaps": 0, "report_gaps": 0}
+    notes_count = None
     try:
         store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
         counts["papers"] = len(store.list_papers())
@@ -720,6 +721,10 @@ def get_status(project_id: str) -> dict:
         counts["properties"] = mstats["total_properties"]
         counts["synthesis"] = mstats["total_synthesis"]
         counts["gaps"] = store.gap_stats()["total"]
+        # 导航「研究现状」统计报告内的问题，而非全部结构化研究缺口。
+        report = store.get_kv("cross_validation_report") or {}
+        counts["report_gaps"] = len(report.get("gaps") or [])
+        notes_count = len(_merged_project_notes(store, state))
     except Exception:  # noqa: BLE001
         pass
 
@@ -750,6 +755,7 @@ def get_status(project_id: str) -> dict:
         "current_node": state.current_node,
         "next_nodes": state.next_nodes,
         "counts": counts,
+        "notes_count": notes_count,
         "pending_human": pending,
         "search_prefs": state.search_prefs,
         "topic_discovery": state.topic_discovery,
@@ -2216,6 +2222,13 @@ def backfill_experiment_results(project_id: str, req: ExperimentBackfillRequest)
     }
 
 
+def _merged_project_notes(store: KnowledgeStore, state: ProjectState) -> list[dict]:
+    """状态计数和笔记列表使用相同的持久化/内存去重口径，不修改存储。"""
+    saved = store.get_kv("user.notes") or []
+    known = {note["note_id"] for note in saved}
+    return saved + [note for note in state.notes if note["note_id"] not in known]
+
+
 @app.post("/api/projects/{project_id}/notes")
 def add_note(project_id: str, req: NoteRequest) -> dict:
     state = _require_project(project_id)
@@ -2229,9 +2242,7 @@ def add_note(project_id: str, req: NoteRequest) -> dict:
         "created_at": datetime.now().isoformat(),
     }
     store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-    saved = store.get_kv("user.notes") or []
-    known = {n["note_id"] for n in saved}
-    notes = saved + [n for n in state.notes if n["note_id"] not in known]
+    notes = _merged_project_notes(store, state)
     notes.append(note)
     store.save_kv("user.notes", notes)
     state.notes = notes
@@ -2242,9 +2253,7 @@ def add_note(project_id: str, req: NoteRequest) -> dict:
 def list_notes(project_id: str) -> dict:
     state = _require_project(project_id)
     store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-    saved = store.get_kv("user.notes") or []
-    known = {n["note_id"] for n in saved}
-    state.notes = saved + [n for n in state.notes if n["note_id"] not in known]
+    state.notes = _merged_project_notes(store, state)
     return {"notes": list(state.notes)}
 
 

@@ -16,6 +16,7 @@ const assert=require('node:assert/strict');
         if(path==='status') body=status;
         else if(path==='workspace') body={workspace,counts,papers:[],project:{topic:status.topic,domain:'ai'},guide_mode:'rules',starters:{study:[],overview:[]}};
         else if(path==='notes') body={notes:[]};
+        else if(path==='research-report') body={report:null};
         else if(path==='experiments') body={experiments:[{experiment_id:'test-exp',name:'软件测试任务',status:'planned',verifies_claim_ids:[],config:{}}]};
         else if(path==='experiment-tasks') body={has_tasks:true,readme:'# 软件测试任务\n本说明不是实际科研产物。',plan:{experiments:[{name:'软件测试任务',experiment_id:'test-exp'}]},export_dir:'fixture'};
         else if(path==='method-doc-status') body={status:'idle'};

@@ -1,0 +1,23 @@
+const assert=require('node:assert/strict');
+require('../web/static/research-flow.js');
+const {summarize}=require('../web/static/project-management.js');
+const item=(id,kind,refs=[],extra={})=>({item_id:id,kind,status:'active',needs_review:false,paper_ids:[],related_ids:refs,...extra});
+const q=item('q','question',[],{paper_ids:['p']}), plan=item('plan','plan',['q']);
+const result=item('r','result',['plan'],{result_status:'failed',metrics:{}}), finding=item('f','finding',['r'],{assessment:'inconclusive'});
+const brief={goal:'软件测试目标',background:'已有代码',resources:'仅CPU',time_budget:'六周'};
+const run=(items=[],extra={},status={status:'completed'})=>summarize({items,brief,...extra},[{paper_id:'p'}],status);
+let count=0;
+function test(name,check){check();count++;}
+test('empty goal needs explicit task',()=>{const m=run([],{brief:{}});assert.equal(m.tasks[0].action,'brief');assert.match(m.blockers[0],/尚未明确/);});
+test('completed background does not complete research',()=>{const m=run([q]);assert.equal(m.systemState,'后台任务已结束');assert.equal(m.researchState,'方法方案待完善');});
+test('experiment pending is a normal research state',()=>assert.equal(run([q,plan],{},{status:'experiment_pending'}).researchState,'等待实际结果'));
+test('failed execution not refuted hypothesis',()=>{const m=run([q,plan,result]);assert.equal(m.researchState,'执行问题待分析');assert.notEqual(m.researchState,'研究失败');});
+test('inconclusive findings not published conclusion',()=>assert.equal(run([q,plan,result,finding]).researchState,'已有判断，待核对证据与局限'));
+test('stale ancestors require review',()=>{const m=run([{...q,needs_review:true},plan,result,finding]);assert.equal(m.researchState,'研究依据待复核');assert.equal(m.inventory.needsReview,1);});
+test('inventory separates legacy and manual results',()=>{const m=run([q,plan,result,finding],{},{status:'completed',counts:{experiments:3}});assert.equal(m.inventory.results,1);assert.equal(m.inventory.legacyExperiments,3);});
+test('multiple questions require explicit selection',()=>assert.equal(run([q,item('q2','question')]).researchState,'待选择研究问题'));
+test('multiple plans require explicit selection',()=>assert.equal(run([q,plan,item('p2','plan',['q'])]).researchState,'待选择当前方案'));
+test('advice is bounded',()=>assert.ok(run([],{brief:{}}).tasks.length<=3));
+test('unknown service state not interpreted as success',()=>assert.equal(run([],{},{status:'future_status'}).systemState,'正在读取后台状态'));
+test('errors do not imply scientific refutation',()=>{const m=run([q],{},{status:'failed',error:'软件测试故障'});assert.equal(m.systemError,'软件测试故障');assert.equal(m.researchState,'方法方案待完善');});
+console.log(JSON.stringify({passed:count,model_calls:0,persistent_writes:0}));
