@@ -40,22 +40,24 @@
         return n;
     }
     function renderContext() {
+        const unsupported=s.data?.research_scope?.supported===false;
         const selected=s.data?.workspace.items.find(item=>item.item_id===s.selected);
         $("rg-focus").hidden=!selected;
         $("rg-focus").textContent=selected ? `讨论参考：${selected.title}（研究记录，非已验证结论）` : "";
         $("rg-page").textContent=(PAGES[s.page] || PAGES.dashboard)[0];
-        $("rg-mode").textContent=s.busy ? "正在思考" : s.data ? s.data.guide_mode==="model" ? "模型已接入" : "规则指导" : s.pid ? "读取材料中" : "未选择项目";
+        $("rg-mode").textContent=unsupported ? "历史领域 · 可查看记录" : s.busy ? "正在思考" : s.data ? s.data.guide_mode==="model" ? "模型已接入" : "规则指导" : s.pid ? "读取材料中" : "未选择项目";
         const starters=$("rg-starters"); starters.replaceChildren();
         const prompts=s.data?.starters[area()] || ["如何把我的研究兴趣收敛成具体问题？"];
         prompts.slice(0,2).forEach(text => {
             const b=el("button","",text); b.type="button"; b.onclick=()=>{ $("rg-input").value=text; s.inputVersion++; sessionStorage.setItem(key(s.pid),text); $("rg-input").focus(); }; starters.append(b);
         });
-        $("rg-send").disabled=!s.data || s.busy; $("rg-send").textContent=s.busy ? "思考中…" : "发送";
+        $("rg-send").disabled=!s.data || s.busy || unsupported; $("rg-send").textContent=s.busy ? "思考中…" : "发送";
+        $("rg-send").title=unsupported ? "该历史领域暂不提供新指导；已有对话、笔记与研究材料保留。" : "";
     }
     function renderMaterials() {
         const box=$("rg-materials"); box.replaceChildren();
         $("rg-material-count").textContent=s.data ? `· ${s.data.papers.length} 篇论文` : "";
-        box.append(el("p","", "默认参考近期论文摘要、已有研究材料与最近灵感笔记；摘要不等于全文。可指定至多三篇论文。"));
+        box.append(el("p","", s.data?.research_scope?.supported===false ? s.data.research_scope.notice + " 当前项目仅保留历史材料浏览与记录。" : "默认参考近期论文摘要、已有研究材料与最近灵感笔记；摘要不等于全文。可指定至多三篇论文。"));
         (s.data?.papers || []).forEach(p => {
             const label=el("label"), input=el("input"); input.type="checkbox"; input.checked=s.papers.includes(p.paper_id);
             input.onchange=()=>{ if (input.checked && s.papers.length>=3) {input.checked=false; error("每次至多选择三篇论文"); return;} s.papers=input.checked ? [...s.papers,p.paper_id] : s.papers.filter(id=>id!==p.paper_id); };
@@ -138,7 +140,7 @@
         $("rg-input").focus();
     });
     $("rg-form").addEventListener("submit",async event=>{
-        event.preventDefault(); const text=$("rg-input").value.trim(); if(!text || !s.pid || !s.data || s.busy) return;
+        event.preventDefault(); const text=$("rg-input").value.trim(); if(!text || !s.pid || !s.data || s.busy || s.data.research_scope?.supported===false) return;
         const pid=s.pid, chosenArea=area(), papers=s.papers.slice(), selected=s.selected, inputVersion=s.inputVersion;
         s.busy=true; error();renderContext();renderMessages(true);
         try {

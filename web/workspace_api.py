@@ -14,6 +14,7 @@ from core.knowledge.schema import ArtifactType
 from core.workspace.guide import STARTERS, build_guide_context, generate_guidance, rule_guidance
 from core.workspace.schema import Area, Brief, Contract, ItemInput
 from core.workspace.service import RevisionConflict, WorkspaceError, WorkspaceService
+from core.research_scope import normalize_public_domain, is_public_domain, SCOPE_NOTICE
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def build_workspace_router(config, require_project, registry_factory=None) -> AP
         return {
             **service.view(workspace), "project": {"topic": project.topic, "domain": project.domain},
             "guide_mode": "rules" if config.dry_run else "model", "starters": STARTERS,
+            "research_scope": {"supported": is_public_domain(project.domain), "notice": SCOPE_NOTICE},
         }
 
     def fail(exc):
@@ -131,6 +133,11 @@ def build_workspace_router(config, require_project, registry_factory=None) -> AP
 
     @router.post("/{project_id}/workspace/guide")
     def guide(project_id: str, request: GuideRequest):
+        project = require_project(project_id)
+        try:
+            normalize_public_domain(project.domain)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         service, project = service_for(project_id)
         if not request.message.strip():
             raise HTTPException(status_code=422, detail="请输入需要讨论的问题")

@@ -1,4 +1,4 @@
-"""研究领域画像（domain profile）：让同一套 Agent 流程适配任意学科。
+"""研究领域画像：首版开放计算机领域，其他画像仅为历史兼容。
 
 设计动机
 --------
@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from core.research_scope import SCOPE_NOTICE, is_public_domain
 
 # ===== 领域画像预设 =====
 # 三个字段 entity / metric / method 直接决定抽取 prompt 的语义：
@@ -31,6 +32,29 @@ from typing import Optional
 #   metric —— 评价指标说明（含典型指标名）
 #   method —— 方法/条件说明（含典型工艺或实验参数）
 DOMAIN_PROFILES: dict[str, dict[str, str]] = {
+    "computer_science": {
+        "label": "软件工程与计算机系统",
+        "core_topics": "软件测试与缺陷定位、程序分析、软件维护、数据库与检索系统、"
+                       "分布式系统、系统可靠性、性能优化与开发工具",
+        "entity": "软件、工具或计算机系统，记录版本、架构、工作负载与实现环境",
+        "metric": "任务完成率、缺陷检出率、误报率、吞吐量、延迟、资源占用与运行成本，"
+                  "需记录测量方法、负载、环境、重复次数及变化范围；未报告的数值留空",
+        "method": "研究任务、数据来源与版本、比较工具、负载设置、运行环境、"
+                  "重复方案、故障条件与复现步骤；不强制套用模型训练参数",
+        "topic_hint": "具体软件或系统、真实任务或负载、可靠性和性能瓶颈与可实施的比较",
+    },
+    "security": {
+        "label": "计算机安全与隐私",
+        "core_topics": "AI 系统安全、提示注入防护、隐私保护、鲁棒学习、软件漏洞检测、"
+                       "依赖与供应链风险、访问控制与安全评测",
+        "entity": "受保护的模型、软件、数据或系统，记录威胁模型、攻击者能力、"
+                  "测试环境与明确授权范围；不涉及真实目标的未授权测试",
+        "metric": "检测率、误报率、防护成功率、攻击成功率、任务质量损失与运行代价，"
+                  "需同时记录威胁条件、数据集与测量口径；不凭空宣称隐私或安全保证",
+        "method": "公开数据或明确授权的隔离环境、攻击与防御假设、对照方案、"
+                  "数据划分、评测协议与复现步骤；区分模拟条件与真实部署",
+        "topic_hint": "具体安全威胁、授权测试条件、防护机制及其有效性与代价",
+    },
     "materials": {
         "label": "材料科学",
         "core_topics": "热电与能量转换材料、电池与储能材料、光伏材料、催化材料、"
@@ -88,7 +112,7 @@ DOMAIN_PROFILES: dict[str, dict[str, str]] = {
     "ai": {
         "label": "人工智能",
         "core_topics": "大语言模型与多模态大模型、智能体与工具调用、检索增强生成（RAG）、"
-                       "模型高效微调与对齐、AI for Science、具身智能与机器人学习、"
+                       "模型高效微调与对齐、AI 系统评测与可靠性、"
                        "可信AI（可解释性/鲁棒性/公平性）、高效推理与模型压缩",
         "entity": "模型、算法或系统（如 Transformer、LoRA 微调方法、"
                   "某检索增强框架），记录其架构、参数量、训练数据与开源情况",
@@ -175,7 +199,8 @@ def build_domain_hint(domain: Optional[str]) -> str:
     """
     if not domain:
         return ""
-    return f"研究领域：{domain_label(domain)}。后续所有抽取、判断与表述都按该领域的术语与标准进行。"
+    hint = f"研究领域：{domain_label(domain)}。后续所有抽取、判断与表述都按该领域的术语与标准进行。"
+    return hint + (f"\n产品能力边界：{SCOPE_NOTICE}" if is_public_domain(domain) else "")
 
 
 def build_topic_recommend_hint(domain: Optional[str]) -> str:

@@ -1358,79 +1358,57 @@
 
     // ===== 1. 项目创建页 =====
 
-    // 研究领域预设：系统本身与领域无关，领域只决定「抽取什么对象 / 关注什么指标 / 记录什么方法」
-    // 选择后作为 domain 注入各阶段 prompt；选「自定义领域」可填写任意学科名称。
-    // 注意：默认值为空（未指定），由用户主动选择——避免默认材料导致推荐主题被带偏。
+    // 首版仅开放计算机研究；与 core/research_scope.py 的公开范围保持契约测试一致。
     const RESEARCH_DOMAINS = [
-        { value: "", label: "未指定（按兴趣自动判断）", hint: "系统按你的研究兴趣与趋势数据自动判断所属学科" },
-        { value: "materials", label: "材料科学", hint: "材料体系 · 性能指标 · 合成/制备工艺" },
-        { value: "chemistry", label: "化学与化工", hint: "反应体系 · 产率/选择性 · 合成路线" },
-        { value: "biology", label: "生命科学", hint: "物种/细胞系/基因 · 表型指标 · 实验方法" },
-        { value: "medicine", label: "医学与药学", hint: "疾病/靶点 · 临床指标 · 干预方案" },
-        { value: "ai", label: "人工智能", hint: "模型/算法 · 评测指标 · 训练配置" },
-        { value: "physics", label: "物理学", hint: "体系/物相 · 观测量 · 实验装置" },
-        { value: "energy", label: "能源与环境", hint: "器件/过程 · 效率指标 · 工艺条件" },
-        { value: "custom", label: "自定义领域", hint: "自行填写领域名称，系统按该领域自适应" },
+        { value: "computer_science", label: "软件工程与计算机系统", hint: "软件测试、程序分析、数据库、系统可靠性与性能评估" },
+        { value: "ai", label: "AI 与机器学习", hint: "模型与算法、RAG、科研 Agent、公开数据上的复现与评测" },
+        { value: "security", label: "计算机安全与隐私", hint: "威胁模型、防护效果与代价；仅限公开数据、模拟环境或明确授权的测试" },
     ];
+    const RESEARCH_SCOPE_NOTICE = "当前版本聚焦计算机研究：辅助文献检索、方法讨论、任务规划和结果整理，不代跑实验、不保证创新成立。暂不支持医学、临床、药物、湿实验和实物设备操作指导，也不提供真人访谈或人体实验的完整指导与伦理审定。历史项目和材料保留。";
 
     function domainLabel(value) {
         const hit = RESEARCH_DOMAINS.find(d => d.value === value);
-        return hit ? hit.label : (value || "未指定");
+        const legacy = {materials:"材料科学",chemistry:"化学与化工",biology:"生命科学",medicine:"医学与药学",physics:"物理学",energy:"能源与环境"};
+        return hit ? hit.label : value ? `${legacy[value] || value}（历史领域）` : "未指定（历史项目）";
     }
 
     function renderCreate(content) {
         const card = el("div", { class: "card" }, [
             el("h2", { class: "page-title" }, "新建与管理"),
             el("p", { class: "muted small mb-0" },
-                "输入研究领域与兴趣，新建项目或切换已有项目。可先探索选题，再阅读文献、明确问题和安排验证。启动后台流程会产生模型调用；实验和创新判断仍需要你实际核查。"),
+                "选择计算机研究方向并填写兴趣，新建项目或查看已有项目。可先探索选题，再阅读文献、明确问题和安排验证。启动后台流程会产生模型调用；实验和创新判断仍需要你实际核查。"),
+            el("p", { class: "muted small", id: "research-scope-notice" }, RESEARCH_SCOPE_NOTICE),
         ]);
 
-        // 研究领域选择（领域无关：同一套流程跑任意学科）
+        // 历史领域不自动加入选项，也不改写旧项目。
         const domainSelect = el("select", { class: "input", id: "domain-select" });
         RESEARCH_DOMAINS.forEach(d => {
             domainSelect.appendChild(el("option", { value: d.value, text: d.label }));
         });
-        // 空字符串 option 需显式设置（部分浏览器不认 value="" 的默认选中）
-        if (!state.domain) domainSelect.selectedIndex = 0;
-        else domainSelect.value = state.domain;
+        domainSelect.value = RESEARCH_DOMAINS.some(d => d.value === state.domain) ? state.domain : "computer_science";
 
         const domainHint = el("p", { class: "muted small mb-0", id: "domain-hint" },
             (RESEARCH_DOMAINS.find(d => d.value === domainSelect.value) || {}).hint || "");
 
-        const domainCustom = el("input", {
-            class: "input mt-8",
-            id: "domain-custom-input",
-            placeholder: "请输入研究领域（如：天体物理、认知科学、金融工程…）",
-            style: domainSelect.value === "custom" ? "" : "display:none",
-        });
-
         domainSelect.addEventListener("change", () => {
             const cur = RESEARCH_DOMAINS.find(d => d.value === domainSelect.value);
             domainHint.textContent = cur ? cur.hint : "";
-            domainCustom.style.display = domainSelect.value === "custom" ? "" : "none";
         });
 
         card.appendChild(el("div", { class: "field" }, [
             el("label", { class: "field-label", for: "domain-select" }, "研究领域"),
             domainSelect,
-            domainCustom,
             domainHint,
         ]));
 
-        // 收集当前选择的领域（预设值或自定义文本）
-        const collectDomain = () => {
-            if (domainSelect.value === "custom") {
-                return (document.getElementById("domain-custom-input").value || "").trim() || "自定义";
-            }
-            return domainSelect.value;
-        };
+        const collectDomain = () => domainSelect.value;
 
         const topicField = el("div", { class: "field" }, [
             el("label", { class: "field-label", for: "topic-input" }, "研究主题"),
             el("textarea", {
                 class: "textarea",
                 id: "topic-input",
-                placeholder: "示例：大语言模型的检索增强生成（也可换任意领域）",
+                placeholder: "例如：联邦学习投毒防御、RAG 引用准确性、软件缺陷检测或系统性能评估",
             }),
         ]);
         card.appendChild(topicField);
@@ -1959,19 +1937,23 @@
 
     function renderTopicDiscovery(content) {
         const status = state.statusCache;
+        const legacyOutsideScope = status?.domain && !RESEARCH_DOMAINS.some(d => d.value === status.domain);
         const td = status?.topic_discovery || {};
         const recommendations = td.recommendations || [];
         const selectedTopic = td.selected_topic || "";
         const interest = td.interest || status?.topic || "";
-        const canSelectTopic = status?.status === "pending_human"
+        const canSelectTopic = !legacyOutsideScope && status?.status === "pending_human"
             && status?.pending_human?.context?.node_id === "topic_select";
 
         const card = el("div", { class: "card" }, [
             el("h2", { class: "page-title" }, "选题探索"),
             el("p", { class: "muted small" },
-                "输入研究兴趣和领域，系统将检索细分方向的真实论文；无可核验证据时不生成推荐。"),
+                "围绕计算机与 AI 研究兴趣，检索细分方向的真实论文；无可核验证据时不生成推荐。"),
+            el("p", { class: "muted small" }, RESEARCH_SCOPE_NOTICE),
         ]);
-        if (status && !["running", "pending_human"].includes(status.status)) {
+        if (legacyOutsideScope) {
+            card.appendChild(el("p", {class:"alert alert-warning"}, "当前项目属于暂未开放的历史领域。已有推荐和材料仍可查看；如需计算机研究，请新建项目，不会改写本项目。"));
+        } else if (status && !["running", "pending_human"].includes(status.status)) {
             card.appendChild(el("button", {class:"btn btn-secondary",onclick:retryTopicDiscovery}, "继续探索选题"));
         }
 

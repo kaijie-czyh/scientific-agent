@@ -107,6 +107,7 @@ from pydantic import Field, ValidationError  # noqa: E402
 from core.experiment_results import SubmittedResult  # noqa: E402
 
 from core.config import get_config  # noqa: E402
+from core.research_scope import normalize_public_domain  # noqa: E402
 from core.knowledge import KnowledgeStore, ExperimentStatus  # noqa: E402
 from core.llm.base import strip_think_tags  # noqa: E402
 from core.llm import LLMRegistry  # noqa: E402
@@ -131,8 +132,7 @@ from stages.common import RESEARCH_SEARCH_PREFS  # noqa: E402
 
 class CreateProjectRequest(BaseModel):
     topic: str
-    # 研究领域（领域自适应）：materials / chemistry / biology / medicine /
-    # ai / physics / energy，或任意自定义领域名称。留空 = 通用领域。
+    # 首版只开放计算机范围；空值兼容旧客户端，归入 computer_science。
     domain: str = ""
 
 
@@ -623,18 +623,26 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ===== 接口实现 =====
 
 
+def _public_domain(domain: str) -> str:
+    try:
+        return normalize_public_domain(domain)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/projects")
 def create_project(req: CreateProjectRequest) -> dict:
     """创建新项目，返回 project_id。"""
     topic = (req.topic or "").strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic 不能为空")
+    domain = _public_domain(req.domain)
     project_id = f"proj_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     state = ProjectState(
         project_id=project_id,
         topic=topic,
         created_at=datetime.utcnow().isoformat(),
-        domain=(req.domain or "").strip(),
+        domain=domain,
     )
     with _LOCK:
         _PROJECTS[project_id] = state
@@ -770,6 +778,7 @@ def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dic
     可选 body: {"force_writing": true} —— 实验失败后强制进入论文写作阶段。
     """
     state = _require_project(project_id)
+    _public_domain(state.domain)
     if state.status == "running":
         raise HTTPException(status_code=409, detail="pipeline 正在运行中")
     if state.status == "pending_human":
@@ -830,7 +839,9 @@ def run_topic_discovery(project_id: str, req: TopicDiscoveryRequest) -> dict:
             detail="当前等待人工响应，请先提交 human-response 或中止",
         )
     resume = state.status not in ("created",)
-    domain = (req.domain or "").strip() or state.domain
+    # 不允许通过该接口把历史非计算机项目静默改为另一领域。
+    _public_domain(state.domain)
+    domain = _public_domain((req.domain or "").strip() or state.domain)
     state.domain = domain  # 记录/更新研究领域
     thread = threading.Thread(
         target=_run_topic_discovery_thread,
@@ -2015,6 +2026,7 @@ def regenerate_method_doc(project_id: str, req: Optional[RegenerateMethodDocRequ
     因此改为后台线程生成，前端轮询 GET /method-doc-status 取结果。
     """
     state = _require_project(project_id)
+    _public_domain(state.domain)
     with _METHOD_REGEN_LOCK:
         job = _METHOD_REGEN_JOBS.get(project_id)
         if job and job.get("status") == "running":
