@@ -75,6 +75,7 @@ def build_guide_context(
     selected_paper_ids: list[str], legacy_notes: list[dict] | None = None,
 ) -> dict:
     workspace = service.load()
+    mainline = service.workflow(workspace)
     items = [i for i in workspace.items if i.status == "active"]
     by_id = {i.item_id: i for i in items}
     if selected_item_id and selected_item_id not in by_id:
@@ -102,11 +103,18 @@ def build_guide_context(
             "excerpts": [{"text": c.text[:1000], "page": c.page} for c in chunks],
         })
     chosen_items = items[-10:]
+    branch = mainline["flow"]
+    branch_ids = {item["item_id"] for item in [branch["question"],branch["plan"],*branch["validResults"],*branch["findings"]] if item}
+    for item in items:
+        if item.item_id in branch_ids and item not in chosen_items:
+            chosen_items.append(item)
     if selected_item_id and by_id[selected_item_id] not in chosen_items:
         chosen_items.append(by_id[selected_item_id])
     return {
         "topic": topic, "area": AREA_LABELS[area], "revision": workspace.revision,
         "brief": workspace.brief.model_dump(), "selected_item_id": selected_item_id,
+        "research_mainline": {"focus":mainline["focus"],"current_stage":mainline["current_stage"],
+                              "next_step":mainline["continuation"],"notice":mainline["evidence_notice"]},
         "paper_scope": {"total_in_project":len(papers), "abstracts_provided":len(chosen_ids), "inventory_limit":80},
         "paper_inventory": [{"paper_id":p.paper_id,"title":p.title} for p in list(papers.values())[:80]],
         "papers": paper_context,

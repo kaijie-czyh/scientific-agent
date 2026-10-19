@@ -22,10 +22,12 @@
         pendingRecordId: null,
         publishedResearchFocus: null,
         statusCache: null,
+        workflowCache: null,
         pollTimer: null,
         pollViewFingerprint: null, // 轮询内容不变时不重建页面，避免滚动条回位
         lastPollAt: 0,
         runMode: "",            // 运行模式（由 /status 的 run_mode 同步）
+        resumingProjectId: null,
         humanFingerprint: null, // 最近一次 pending_human 的指纹（用于跳过无变化的整页重建）
         humanDraft: "",         // 人工输入草稿（轮询重建时恢复）
         pendingPaperId: null,   // 待定位论文（证据溯源跳转：gaps/claims → papers 定位高亮）
@@ -432,6 +434,11 @@
     function setActivePage(page) {
         if (!NAVIGATION.pages[page]) page = "dashboard";
         state.currentPage = page;
+        const url=new URL(window.location.href);
+        url.searchParams.set("page",page);
+        if(state.currentProjectId) url.searchParams.set("project",state.currentProjectId);
+        else {url.searchParams.delete("project");url.searchParams.delete("paper");url.searchParams.delete("exp");}
+        window.history.replaceState(null,"",url);
         state.pollViewFingerprint = null;
         document.querySelectorAll(".nav-item").forEach(n => {
             const active = n.getAttribute("data-page") === (NAVIGATION.pages[page].owner || page);
@@ -585,6 +592,9 @@
             if (pid !== state.currentProjectId) return;
             const prevPending = state.statusCache?.pending_human;
             state.statusCache = data;
+            if(data.workflow) state.workflowCache={projectId:pid,...data.workflow};
+            state.runMode = data.run_mode || "";
+            state.domain = data.domain || "";
             if (data.notes_count != null) state.notesCount = data.notes_count;
             if (data.counts?.report_gaps != null) state.reportGapsCount = data.counts.report_gaps;
             else refreshReportBadgeCount(pid); // 兼容尚未重启升级的服务，不以全部缺口数冒充报告问题数。
@@ -604,7 +614,7 @@
                     pending_human: data.pending_human, stage_statuses: data.stage_statuses,
                     counts: data.counts, node_history: data.node_history,
                     topic_discovery: data.topic_discovery,
-                    node_progress: data.node_progress,
+                    node_progress: data.node_progress, workflow: data.workflow,
                 });
                 if (fingerprint !== state.pollViewFingerprint) {
                     state.pollViewFingerprint = fingerprint;
@@ -640,18 +650,24 @@
     function updateBadges(data) {
         if (data.project_id && data.project_id !== state.currentProjectId) return;
         const counts = data.counts || {};
-        const records = state.workspaceCountsProjectId === state.currentProjectId ? state.workspaceCounts : null;
+        const cached=state.workflowCache?.projectId===state.currentProjectId ? state.workflowCache : null;
+        const workflow=cached && cached.revision>(data.workflow?.revision ?? -1) ? cached : data.workflow || cached;
+        const records = workflow?.counts || (state.workspaceCountsProjectId === state.currentProjectId ? state.workspaceCounts : null);
         const count = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
         setBadge("badge-papers", counts.papers);
         setBadge("badge-gaps", records ? records.question : null);
         setBadge("badge-report-gaps", counts.report_gaps ?? state.reportGapsCount);
         setBadge("badge-claims", counts.claims);
-        setBadge("badge-experiments", records ? count(records.plan) + count(records.result) + count(counts.experiments) : counts.experiments);
-        setBadge("badge-writing", records ? records.outline : null);
+        const sourceTasks=workflow?.materials?.filter(source=>source.kind==="experiment_plan") || [];
+        const linkedTasks=sourceTasks.filter(source=>source.linked_item_id && !source.linked_needs_review).length;
+        setBadge("badge-experiments", workflow ? sourceTasks.length+Math.max(0,count(records?.plan)-linkedTasks) : records ? count(records.plan) + count(records.result) + count(counts.experiments) : counts.experiments);
+        setBadge("badge-writing", records ? count(records.outline) + count(counts.writing_artifacts) : counts.writing_artifacts);
+        const writingBadge = document.getElementById("badge-writing");
+        if(writingBadge) writingBadge.title = `写作提纲：${records?.outline || 0}；已保存稿件与修改意见：${counts.writing_artifacts ?? "待读取"}（不表示论文已审核完成）`;
         const questionsBadge = document.getElementById("badge-gaps");
         if (questionsBadge) questionsBadge.title = `已保存且无需复核的问题：${records?.question || 0}；文献待核实线索：${counts.gaps || 0}；原论断：${counts.claims || 0}`;
         const experimentsBadge = document.getElementById("badge-experiments");
-        if (experimentsBadge) experimentsBadge.title = `方案：${records?.plan || 0}；实际结果记录：${records?.result || 0}；原实验记录：${counts.experiments || 0}（计数不表示实验成功）`;
+        if (experimentsBadge) experimentsBadge.title = workflow ? `方案 / 任务来源数（按关联去重，不累计结果）：已确认方案 ${records?.plan || 0}；任务来源 ${sourceTasks.length}；实际结果记录 ${records?.result || 0}。不表示实验成功。` : `方案：${records?.plan || 0}；实际结果记录：${records?.result || 0}；原实验记录：${counts.experiments || 0}（计数不表示实验成功）`;
         setBadge("badge-notes", state.notesCount ?? data.notes_count ?? null);
         const reportBadge = document.getElementById("badge-report-gaps");
         if (reportBadge) reportBadge.title = "研究现状报告中的候选问题数（不等于全部研究缺口数）";
@@ -733,6 +749,23 @@
             return null;
         }
         host.style.display = "";
+
+        const workflow=state.workflowCache?.projectId===state.currentProjectId ? state.workflowCache : state.statusCache?.workflow;
+        if(workflow?.stages) {
+            const current=workflow.current_stage==="assessment" ? "experiment" : workflow.current_stage;
+            const steps=el("div",{class:"flow-steps research-path-steps"});
+            workflow.stages.forEach((stage,index)=>{
+                const active=stage.id===current;
+                const viewing=stage.page===state.currentPage && (stage.page!=="experiments" || stage.id===(["design","experiment"].includes(current) ? current : "design"));
+                steps.appendChild(el("button",{class:`flow-step ${active ? 'active' : 'pending'}${viewing ? ' viewing' : ''}`,"data-stage":stage.id,"aria-current":active ? "step" : "false",title:stage.detail,onclick:()=>setActivePage(stage.page)},[
+                    el("span",{class:"flow-step-num"},String(index+1)),el("span",{class:"flow-step-label"},stage.label),
+                    el("span",{class:"research-path-state"},({available:"有材料",confirmed:"已确认",review:"待核对",recorded:"有记录",waiting:"待结果",pending:"待推进"})[stage.state] || stage.state),
+                ]));
+            });
+            const wrap=el("div",{class:"flow-nav"},[el("span",{class:"flow-nav-title"},"科研路径"),steps]);
+            if(workflow.execution?.action==="confirm") wrap.appendChild(el("button",{class:"btn btn-secondary btn-sm",onclick:()=>setActivePage("human")},"待确认事项"));
+            host.appendChild(wrap);steps.scrollLeft=prevScrollLeft;return wrap;
+        }
 
         const stepsEl = el("div", { class: "flow-steps", id: "flow-steps" });
         FLOW_STEPS.forEach((s, i) => {
@@ -843,39 +876,32 @@
         }
 
         // 骨架屏占位
+        const pid=state.currentProjectId;
         content.appendChild(renderSkeleton("cards"));
         try {
             const data = await api("GET", `/api/projects/${state.currentProjectId}/dashboard`);
+            if(pid!==state.currentProjectId || state.currentPage!=="dashboard") return;
             state.dashboardCache = data;
             clear(content);
             content.appendChild(el("div", {class:"page-header"}, [el("h2", {class:"page-title"}, "项目总览"), el("p", {class:"page-desc"}, "集中查看当前项目的任务状态与已有材料，点击研究路径进入对应页面。") ]));
+            content.appendChild(renderQuickStartGuide());
+            content.appendChild(renderContinuationCard(data));
             const workspaceData=api("GET",`/api/projects/${state.currentProjectId}/workspace`);
-            renderProjectManagement(content,workspaceData);
-            renderResearchFlow(content,workspaceData);
-
-            // 顶部状态横幅
-            content.insertAdjacentHTML("beforeend",
-                statusBanner(data.status, data.summary, null, data.recommendation, data.advice));
-
-            // 通用科研链路进度（领域无关：调研 → 思路 → 设计 → 实验 → 写作）
-            content.appendChild(renderResearchChain(data));
-
-            // 阶段进度条
-            content.appendChild(renderStageProgress(data));
-
-            // 计数卡片
-            content.appendChild(renderDashboardCounts(data.counts || {}));
-
-            // 调研报告 / 研究缺口 / Claim 与实验（三栏摘要）
-            content.appendChild(renderDashboardSummaries(data));
-
-            // 数据源合规性卡片
-            renderDashboardDataSources(content);
-
-            // 快速操作
-            content.appendChild(renderDashboardActions(data));
-
-            content.appendChild(el("p", {class:"muted small"}, "方法文档已归入「方案与实验」；提纲与稿件请到「成果写作」查看。"));
+            const workGrid=el("div",{class:"overview-work-grid"});
+            content.appendChild(workGrid);
+            renderProjectManagement(workGrid,workspaceData);
+            renderResearchFlow(workGrid,workspaceData);
+            let materialLinks=renderOverviewLinks(data);
+            content.appendChild(materialLinks);
+            workspaceData.then(workspace=>{
+                if(pid!==state.currentProjectId || !materialLinks.isConnected) return;
+                const updated=renderOverviewLinks(data,workspace.counts);
+                materialLinks.replaceWith(updated);materialLinks=updated;
+            }).catch(()=>{}); // 项目管理区域会显示详细读取错误，不把未知记录数写成零。
+            const more=el("details",{class:"card overview-more"},el("summary",{},"更多操作、数据来源与文件下载"));
+            renderDashboardDataSources(more);
+            more.appendChild(renderDashboardActions(data));
+            content.appendChild(more);
         } catch (e) {
             clear(content);
             content.appendChild(renderErrorState({
@@ -892,50 +918,54 @@
     }
 
     function renderDashboardIntro() {
-        return el("div", { class: "dashboard-intro" }, [
-            el("div", { class: "card hero-card" }, [
-                el("div", { class: "hero-eyebrow" }, "文献驱动 · 科研指导 · 研究记录"),
-                el("h1", { class: "hero-title" }, "把研究思路逐步变成有依据的成果"),
-                el("p", { class: "hero-desc" },
-                    "从选题探索、文献阅读到研究问题、方案与实验，再整理成果。" +
-                    "保留你的灵感与判断，随时与科研指导讨论；来源不足、实验失败或尚无结论都应如实记录。"),
-                el("div", { class: "btn-row mt-16" }, [
-                    el("button", { class: "btn btn-success", onclick: () => setActivePage("create") }, "启动新项目"),
-                ]),
+        return renderQuickStartGuide();
+    }
+
+    function renderQuickStartGuide() {
+        const instructions=el("details",{class:"quick-start-details"},el("summary",{},"查看使用说明"));
+        instructions.append(
+            el("ol", {class:"quick-start-steps"}, [
+                el("li", {}, "找方向、读论文：创建项目或探索选题，在文献库与研究现状核对来源。"),
+                el("li", {}, "明确问题、审核方案：确认研究问题、数据、设备和时间，再安排验证任务。"),
+                el("li", {}, "外部执行、回来回填：系统不代跑实验。保存任务后可以离开，完成后回来提交真实结果。"),
+                el("li", {}, "核对结论、整理成果：支持、反驳或无法定论都如实记录，在成果写作查看与导出。"),
             ]),
-            el("div", { class: "counts-grid" }, [
-                el("div", { class: "count-card highlight" }, [
-                    el("div", { class: "count-label" }, "研究过程"),
-                    el("div", { class: "count-value" }, "✓"),
-                    el("div", { class: "count-extra" }, "保留原有流程条与需要你确认的任务"),
-                ]),
-                el("div", { class: "count-card highlight" }, [
-                    el("div", { class: "count-label" }, "自定义领域"),
-                    el("div", { class: "count-value" }, "✓"),
-                    el("div", { class: "count-extra" }, "按研究场景查文献，覆盖程度需自行核查"),
-                ]),
-                el("div", { class: "count-card" }, [
-                    el("div", { class: "count-label" }, "多源融合"),
-                    el("div", { class: "count-value" }, "3 源"),
-                    el("div", { class: "count-extra" }, "arxiv + Semantic Scholar + Sciverse 联合检索"),
-                ]),
-                el("div", { class: "count-card" }, [
-                    el("div", { class: "count-label" }, "证据链"),
-                    el("div", { class: "count-value" }, "可查看"),
-                    el("div", { class: "count-extra" }, "区分论文来源、研究设想与实际结果"),
-                ]),
+            el("p",{class:"muted small"},"中断后，在「新建与管理」选择项目或粘贴编号，点击“打开并继续”。任务结束不等于创新成立。"),
+        );
+        return el("section", {class:"card quick-start-guide", "aria-label":"科研工作台使用说明"}, [
+            el("div",{class:"quick-start-heading"},[
+                el("h3", {class:"card-title"}, "科研工作台 · 从兴趣到有依据的成果"),
+                el("button", {class:"btn btn-secondary btn-sm", onclick:()=>setActivePage("create")}, "新建 / 继续项目"),
             ]),
-            el("div", { class: "card" }, [
-                el("div", { class: "card-title" }, "核心能力"),
-                el("ul", { class: "feature-list" }, [
-                    el("li", {}, "选题与阅读：复用现有检索、导入、论文浏览和研究现状汇总，核对原文后再判断。"),
-                    el("li", {}, "问题与方案：保存可检验的研究问题，再关联方案、实际结果和研究判断。"),
-                    el("li", {}, "科研指导：结合当前项目讨论；只有明确采纳的建议才进入研究记录。"),
-                    el("li", {}, "灵感与证据：保留原来的灵感笔记、论断及证据关联，不自动把想法标成事实。"),
-                    el("li", {}, "成果整理：保存提纲、回看已有稿件和修改意见；实验需实际执行，完整论文不会凭空产生。"),
-                ]),
-            ]),
+            el("p", {class:"muted small"}, "查文献 → 定问题 → 审方案 → 回填真实结果 → 整理成果。系统不代跑实验，科研指导在右侧，关键选择由你确认。"),
+            instructions,
         ]);
+    }
+
+    function renderOverviewLinks(data,records=null) {
+        const counts=data.counts || {}, report=data.research_report_summary || {};
+        const links=[
+            ["文献库",`${counts.papers || 0} 篇论文`,"papers"],
+            ["研究现状",`${report.gaps_count || 0} 个候选问题`,"research-report"],
+            ["研究问题",records ? `${records.question || 0} 个问题 · ${counts.ideas || 0} 条思路` : `${counts.ideas || 0} 条思路`,"gaps"],
+            ["方案与实验",records ? `${records.plan || 0} 份方案 · ${records.result || 0} 条结果` : `${counts.experiments || 0} 条实验任务`,"experiments"],
+            ["成果写作",records ? `${records.outline || 0} 份提纲 · ${counts.writing_artifacts || 0} 份稿件 / 审阅` : `${counts.writing_artifacts || 0} 份稿件 / 审阅记录`,"writing"],
+        ];
+        return el("nav",{class:"overview-shortcuts","aria-label":"项目材料快捷入口"},links.map(([title,detail,page])=>
+            el("button",{class:"overview-shortcut",onclick:()=>setActivePage(page)},[
+                el("strong",{},title),el("span",{class:"muted small"},detail),el("span",{class:"shortcut-arrow","aria-hidden":"true"},"↗"),
+            ])));
+    }
+
+    function renderContinuationCard(data) {
+        const next=data.continuation;
+        const box=el("section",{class:"card continuation-card","aria-label":"当前任务与下一步"},[
+            el("h3",{class:"card-title"},"当前任务与下一步"),
+            el("p",{}, next?.hint || data.summary || "可以查看已有材料，或继续上次任务。"),
+            el("p",{class:"muted small"},`后台研究主题：${data.topic || "待确认"}；记录主线的选择不会自动替换该主题。`),
+            el("button",{class:"btn btn-success",onclick:()=>startPipeline()},next?.label || "继续当前任务"),
+        ]);
+        return box;
     }
 
     function renderResearchChain(data) {
@@ -1255,7 +1285,7 @@
                 el("button", {
                     class: "btn btn-success",
                     onclick: () => startPipeline(),
-                }, data.status === "created" ? "启动 Pipeline" : "继续 Pipeline"),
+                }, data.continuation?.label || (data.status === "created" ? "启动研究任务" : "继续当前任务")),
                 el("button", {
                     class: "btn btn-secondary",
                     onclick: () => setActivePage("progress"),
@@ -1290,9 +1320,9 @@
         card.appendChild(el("p", { class: "muted small" },
             "保留原流程的方法设计文档：问题定义、方法概述、必要公式与实验建议。" +
             "若旧文档为空，可手动重新生成并保存新版本；这会调用模型，生成方案不表示已经完成实验。"));
-        const pre = el("pre", {
-            class: "code-block",
-            style: "display:none; max-height:460px; overflow:auto; white-space:pre-wrap;",
+        const pre = el("div", {
+            class: "research-document",
+            style: "display:none; max-height:620px; overflow:auto;",
         });
         const msg = el("div", { class: "small muted mt-8" });
         const row = el("div", { class: "btn-row mt-8" });
@@ -1308,7 +1338,7 @@
                 const resp = await fetch(SRA_API_BASE +
                     `/api/projects/${pid}/download/method-doc`);
                 if (!resp.ok) throw new Error("方法文档暂时无法读取");
-                pre.textContent = await resp.text();
+                await window.SRA_DOCUMENT.render(pre, await resp.text());
                 pre.style.display = "block";
             } catch (e) {
                 showToast(`读取失败：${e.message}`, "error");
@@ -1332,7 +1362,7 @@
                         clearInterval(poll);
                         regenBtn.disabled = false;
                         if (st.status === "done") {
-                            pre.textContent = st.content || "";
+                            await window.SRA_DOCUMENT.render(pre, st.content || "");
                             pre.style.display = "block";
                             msg.textContent = st.message || "已重新生成";
                             showToast(st.message || "方法文档已重新生成", "success");
@@ -1350,6 +1380,14 @@
         });
         row.appendChild(viewBtn);
         row.appendChild(regenBtn);
+        const sourceBtn = el("button", { class: "btn btn-secondary" }, "查看原文");
+        sourceBtn.onclick = () => { sourceBtn.textContent = window.SRA_DOCUMENT.toggleSource(pre) ? "返回公式预览" : "查看原文"; };
+        const htmlBtn = el("button", { class: "btn btn-secondary" }, "下载公式版 HTML");
+        const printBtn = el("button", { class: "btn btn-secondary" }, "公式版打印 / PDF");
+        htmlBtn.onclick = () => window.SRA_DOCUMENT.download(pre,"方法文档").catch(e=>showToast(e.message,"error"));
+        printBtn.onclick = () => window.SRA_DOCUMENT.print(pre,"方法文档").catch(e=>showToast(e.message,"error"));
+        row.append(sourceBtn,htmlBtn,printBtn);
+        card.appendChild(el("p", { class: "muted small" }, "查看后可下载离线公式版 HTML，或通过打印保存公式版 PDF。Markdown 原文保留；原有 Word/PDF 下载仍是简化文本版。"));
         card.appendChild(row);
         card.appendChild(pre);
         card.appendChild(msg);
@@ -1373,11 +1411,17 @@
     }
 
     function renderCreate(content) {
-        const card = el("div", { class: "card" }, [
+        content.appendChild(el("div",{class:"page-header"},[
             el("h2", { class: "page-title" }, "新建与管理"),
-            el("p", { class: "muted small mb-0" },
-                "选择计算机研究方向并填写兴趣，新建项目或查看已有项目。可先探索选题，再阅读文献、明确问题和安排验证。启动后台流程会产生模型调用；实验和创新判断仍需要你实际核查。"),
-            el("p", { class: "muted small", id: "research-scope-notice" }, RESEARCH_SCOPE_NOTICE),
+            el("p", {class:"page-desc"},"开始一项研究，或回到已有项目。创建项目不会自动执行实验。"),
+        ]));
+        const setup=el("div",{class:"project-setup-grid"});
+        const card = el("section", { class: "card project-create-card" }, [
+            el("h3", {class:"card-title"},"开始新研究"),
+        ]);
+        const resumeCard=el("section",{class:"card project-resume-card"},[
+            el("h3",{class:"card-title"},"接着上次的工作"),
+            el("p",{class:"muted small"},"项目进度会保存在本机。直接在下方选择项目，或粘贴编号继续；无需重新创建。"),
         ]);
 
         // 历史领域不自动加入选项，也不改写旧项目。
@@ -1414,7 +1458,7 @@
         card.appendChild(topicField);
 
         const btnRow = el("div", { class: "btn-row" }, [
-            el("button", { class: "btn", id: "create-btn" }, "启动科研"),
+            el("button", { class: "btn", id: "create-btn" }, "创建项目"),
             el("button", { class: "btn btn-outline", id: "topic-discovery-create-btn" }, "探索选题"),
         ]);
         card.appendChild(btnRow);
@@ -1426,30 +1470,30 @@
                 el("input", {
                     class: "input",
                     id: "resume-project-input",
-                    placeholder: "粘贴已有 Project ID（服务重启后项目自动恢复，可直接查看数据）",
+                    placeholder: "粘贴项目编号，如 proj_…",
                     style: "flex:1;min-width:0;",
                 }),
-                el("button", { class: "btn btn-outline", id: "resume-project-btn" }, "继续"),
-                el("button", { class: "btn btn-danger btn-outline", id: "delete-project-btn" }, "删除"),
+                el("button", { class: "btn btn-outline", id: "resume-project-btn" }, "打开并继续"),
             ]),
         ]);
-        card.appendChild(resumeRow);
+        resumeCard.appendChild(resumeRow);
 
         // 会话重置：刷新项目 → 回到无项目状态（不清磁盘数据，仅清前端记忆）
-        const sessionRow = el("div", { class: "field mt-16" }, [
-            el("label", { class: "field-label" }, "会话重置"),
+        const sessionRow = el("details", { class: "session-options" }, [
+            el("summary", {}, "使用范围与会话设置"),
+            el("p", { class: "muted small", id: "research-scope-notice" }, RESEARCH_SCOPE_NOTICE),
             el("p", { class: "muted small mb-8" },
                 "刷新项目 = 清除页面上的项目记忆（localStorage），回到未创建项目的初始状态。磁盘上的项目数据保留，仍可用上方 Project ID 继续访问。"),
             el("div", { class: "btn-row" }, [
-                el("button", { class: "btn btn-outline", id: "reset-session-btn" }, "刷新项目（回到无项目状态）"),
+                el("button", { class: "btn btn-outline btn-sm", id: "reset-session-btn" }, "退出当前项目"),
             ]),
         ]);
-        card.appendChild(sessionRow);
+        resumeCard.appendChild(sessionRow);
 
         const resultArea = el("div", { id: "create-result" });
-        card.appendChild(resultArea);
-
-        content.appendChild(card);
+        resumeCard.appendChild(resultArea);
+        setup.append(card,resumeCard);
+        content.appendChild(setup);
 
         // 绑定「继续已有项目」
         document.getElementById("resume-project-btn").addEventListener("click", async () => {
@@ -1463,57 +1507,13 @@
             btn.textContent = "恢复中…";
             try {
                 const st = await api("GET", `/api/projects/${pid}/status`);
-                state.currentProjectId = pid;
-                updateProjectIdDisplay();
-                startPolling();
-                renderSidebarNotes();
-                renderCreateResult(resultArea, { project_id: pid, topic: st.topic || "" });
-                showToast("已恢复项目，可查看数据", "success");
-                // 留在新建页展示恢复结果（主题/操作按钮），由用户决定下一步
-                // 不再强制跳转 papers，让主题展示可见
+                activateProject(st);
+                await startPipeline();
             } catch (e) {
-                showToast("项目不存在：" + e.message, "error");
+                showToast("项目打开失败：" + e.message, "error");
             } finally {
                 btn.disabled = false;
-                btn.textContent = "继续";
-            }
-        });
-
-        // 绑定「删除项目」
-        document.getElementById("delete-project-btn").addEventListener("click", async () => {
-            const pid = document.getElementById("resume-project-input").value.trim();
-            if (!pid) {
-                showToast("请输入要删除的 Project ID", "error");
-                return;
-            }
-            if (!confirm(`确认删除项目 ${pid}？\n\n此操作不可恢复：内存中的运行状态将被清理，磁盘上的项目数据（论文/知识三元组/Claim/实验等）也将一并删除。`)) {
-                return;
-            }
-            const btn = document.getElementById("delete-project-btn");
-            btn.disabled = true;
-            btn.textContent = "删除中…";
-            try {
-                await api("DELETE", `/api/projects/${pid}`);
-                // 若删的就是当前项目，重置前端状态并回到「新建项目」页
-                if (state.currentProjectId === pid) {
-                    state.currentProjectId = null;
-                    state.statusCache = null;
-                    state.dashboardCache = null;
-                    state.researchReportCache = null;
-                    state.papersCache = null;
-                    clearProjectFromStorage();
-                    stopPolling();
-                    updateProjectIdDisplay();
-                    renderSidebarNotes();
-                    setActivePage("create");
-                }
-                showToast("项目已删除", "success");
-                document.getElementById("resume-project-input").value = "";
-            } catch (e) {
-                showToast("删除失败：" + e.message, "error");
-            } finally {
-                btn.disabled = false;
-                btn.textContent = "删除";
+                btn.textContent = "打开并继续";
             }
         });
 
@@ -1553,7 +1553,7 @@
                 showToast("刷新失败：" + e.message, "error");
             } finally {
                 btn.disabled = false;
-                btn.textContent = "刷新项目（回到无项目状态）";
+                btn.textContent = "退出当前项目";
             }
         });
 
@@ -1570,10 +1570,7 @@
             showLoadingOverlay("正在创建项目…");
             try {
                 const data = await api("POST", "/api/projects", { topic, domain: collectDomain() });
-                state.currentProjectId = data.project_id;
-                state.domain = data.domain || collectDomain();
-                saveProjectToStorage(data.project_id);
-                updateProjectIdDisplay();
+                activateProject(data);
                 startPolling();
                 renderSidebarNotes();
                 renderSidebarDownload();
@@ -1583,7 +1580,7 @@
                 showToast("创建失败：" + e.message, "error");
             } finally {
                 btn.disabled = false;
-                btn.textContent = "启动科研";
+                btn.textContent = "创建项目";
                 hideLoadingOverlay();
             }
         });
@@ -1601,9 +1598,7 @@
             try {
                 // 创建项目（topic 字段暂存研究兴趣）
                 const data = await api("POST", "/api/projects", { topic, domain: collectDomain() });
-                state.currentProjectId = data.project_id;
-                state.domain = data.domain || collectDomain();
-                updateProjectIdDisplay();
+                activateProject(data);
                 startPolling();
                 renderSidebarNotes();
                 // 启动方向推荐
@@ -1623,60 +1618,106 @@
         if (state.currentProjectId) {
             renderCreateResult(resultArea, { project_id: state.currentProjectId, topic: state.statusCache?.topic || "" });
         }
-        // 若已有项目，显示当前项目并允许切换
-        if (state.currentProjectId) {
-            renderCreateResult(resultArea, { project_id: state.currentProjectId, topic: state.statusCache?.topic || "" });
-        }
-
-        // 文件上传区（上传文献 PDF/文本 或 主题描述文件）
-        if (state.currentProjectId) {
-            content.appendChild(renderUploadCard());
-        }
-
         // 项目列表（刷新后可恢复/切换）
         renderProjectList(content);
     }
 
     async function renderProjectList(content) {
+        const card=el("section",{class:"card project-library","aria-label":"已有项目"},el("p",{class:"muted small"},"正在读取项目…"));
+        content.appendChild(card);
         try {
             const data = await api("GET", "/api/projects");
-            const projects = data.projects || [];
-            if (!projects.length) return;
-            const card = el("div", { class: "card" }, [
-                el("div", { class: "card-title" }, "已有项目（点击切换）"),
-            ]);
-            const list = el("div", { class: "list" });
-            projects.forEach(p => {
-                const isCurrent = p.project_id === state.currentProjectId;
-                const item = el("div", {
-                    class: `list-item project-switch-item ${isCurrent ? "current" : ""}`,
-                    onclick: async () => {
-                        state.currentProjectId = p.project_id;
-                        saveProjectToStorage(p.project_id);
-                        updateProjectIdDisplay();
-                        startPolling();
-                        renderSidebarDownload();
-                        showToast(`已切换到项目：${p.topic.slice(0, 30)}`, "success");
-                        setActivePage("dashboard");
-                    },
-                });
-                item.appendChild(el("div", { class: "list-item-head" }, [
-                    el("span", { class: "list-item-title", text: p.topic || "(无主题)" }),
-                    isCurrent ? el("span", { class: "badge badge-success", text: "当前" }) : null,
-                    el("span", { class: `badge ${statusBadge(p.status).match(/badge-(\w+)/)?.[1] || "badge-neutral"}`, text: p.status }),
-                ]));
-                item.appendChild(el("div", { class: "small muted" },
-                    `${p.project_id} · ${formatTime(p.created_at)}`));
-                if (p.summary) {
-                    item.appendChild(el("div", { class: "small muted" },
-                        (p.summary || "").slice(0, 80)));
+            // 静态资源可先于服务升级；不可向旧的物理删除接口降级。
+            let batchSupported=false;
+            try {const schema=await api("GET","/openapi.json");batchSupported=!!schema.paths?.["/api/projects/batch-delete"]?.post;} catch(_) {}
+            if(!card.isConnected || state.currentPage!=="create") return;
+            let projects=data.projects || [], page=1, deleting=false;
+            const selected=new Set(), pageSize=8;
+            const heading=el("h3",{class:"card-title"},"已有项目");
+            const search=el("input",{class:"input project-search",type:"search",placeholder:"搜索主题或项目编号","aria-label":"搜索已有项目"});
+            const deleteButton=el("button",{class:"btn btn-danger btn-outline btn-sm",id:"delete-selected-projects",disabled:true},"删除所选");
+            const count=el("span",{class:"muted small",role:"status"});
+            const selectAll=el("input",{type:"checkbox","aria-label":"全选当前页"});
+            const list=el("div",{class:"project-library-list"});
+            const previous=el("button",{class:"btn btn-secondary btn-sm",onclick:()=>{page--;paint();}},"上一页");
+            const next=el("button",{class:"btn btn-secondary btn-sm",onclick:()=>{page++;paint();}},"下一页");
+            const pageLabel=el("span",{class:"muted small"});
+            const clearSelection=el("button",{class:"btn btn-secondary btn-sm",onclick:()=>{selected.clear();paint();}},"清空选择");
+            const deletable=p=>batchSupported && !['running','pending_human'].includes(p.status);
+            const filtered=()=>projects.filter(p=>`${p.topic || ''} ${p.project_id}`.toLowerCase().includes(search.value.trim().toLowerCase()));
+            const visible=()=>filtered().slice((page-1)*pageSize,page*pageSize);
+            function paint() {
+                const matches=filtered(), totalPages=Math.max(1,Math.ceil(matches.length/pageSize));
+                page=Math.max(1,Math.min(page,totalPages));
+                const candidates=visible().filter(deletable);
+                selectAll.checked=!!candidates.length && candidates.every(p=>selected.has(p.project_id));
+                selectAll.indeterminate=!selectAll.checked && candidates.some(p=>selected.has(p.project_id));
+                selectAll.disabled=deleting || !candidates.length;
+                count.textContent=`共 ${projects.length} 个 · 匹配 ${matches.length} 个 · 已选 ${selected.size} 个（含其他页）`;
+                deleteButton.disabled=deleting || !batchSupported || !selected.size;
+                deleteButton.textContent=!batchSupported ? "重启服务后可批量删除" : deleting ? "正在移入归档…" : `删除所选${selected.size ? `（${selected.size}）` : ''}`;
+                clearSelection.disabled=deleting || !selected.size;
+                search.disabled=deleting;
+                previous.disabled=deleting || page===1;next.disabled=deleting || page===totalPages;
+                pageLabel.textContent=`${page} / ${totalPages} 页`;
+                list.replaceChildren();
+                if(!matches.length) list.appendChild(el("p",{class:"muted project-list-empty"},projects.length ? "没有匹配的项目，试试其他关键词。" : "还没有项目，从上方创建你的第一项研究。"));
+                for(const p of visible()) {
+                    const checkbox=el("input",{type:"checkbox","aria-label":`选择项目 ${p.project_id}`,disabled:deleting || !deletable(p)});
+                    checkbox.checked=selected.has(p.project_id);
+                    checkbox.addEventListener("change",()=>{if(checkbox.checked) selected.add(p.project_id);else selected.delete(p.project_id);paint();});
+                    const open=async resume=>{
+                        try {activateProject(await api("GET",`/api/projects/${p.project_id}/status`));if(resume) await startPipeline();else setActivePage("dashboard");}
+                        catch(e){showToast("打开失败："+e.message,"error");}
+                    };
+                    const row=el("div",{class:`project-library-row${p.project_id===state.currentProjectId ? ' current' : ''}`,"data-project-id":p.project_id},[
+                        checkbox,
+                        el("div",{class:"project-row-info"},[
+                            el("button",{class:"project-title-link",disabled:deleting,onclick:()=>open(false)},p.topic || "未命名研究"),
+                            el("div",{class:"muted small project-row-meta"},`${p.project_id} · ${formatTime(p.created_at)}`),
+                        ]),
+                        el("div",{class:"project-row-actions"},[
+                            el("span",{class:"muted small"},({created:"未开始",running:"运行中",pending_human:"待确认",completed:"已结束",stopped:"已暂停",failed:"需重试",cancelled:"已取消"})[p.status] || p.status),
+                            p.project_id===state.currentProjectId ? el("span",{class:"badge badge-success"},"当前") : null,
+                            el("button",{class:"btn btn-secondary btn-sm",disabled:deleting,onclick:()=>open(true)},"继续 / 查看进展"),
+                        ]),
+                    ]);
+                    list.appendChild(row);
                 }
-                list.appendChild(item);
+            }
+            search.addEventListener("input",()=>{page=1;paint();});
+            selectAll.addEventListener("change",()=>{for(const p of visible().filter(deletable)) {if(selectAll.checked) selected.add(p.project_id);else selected.delete(p.project_id);}paint();});
+            deleteButton.addEventListener("click",async()=>{
+                const ids=[...selected];
+                if(!ids.length || deleting) return;
+                if(ids.length>200) {showToast("每批最多删除 200 个项目，请减少选择。","warning");return;}
+                const names=projects.filter(p=>selected.has(p.project_id)).map(p=>`${p.topic || '未命名研究'} (${p.project_id})`);
+                if(!confirm(`确认删除选中的 ${ids.length} 个项目？\n${names.slice(0,8).join('\n')}${names.length>8 ? '\n…' : ''}\n\n将从列表移除并移入本机可恢复归档，不会直接抹除文件。运行中或待确认的项目不能删除。`)) return;
+                deleting=true;paint();
+                try {
+                    const response=await api("POST","/api/projects/batch-delete",{project_ids:ids});
+                    projects=projects.filter(p=>!ids.includes(p.project_id));selected.clear();
+                    if(ids.includes(state.currentProjectId)) {
+                        state.currentProjectId=null;state.statusCache=null;state.statusCachePrevious=null;
+                        state.dashboardCache=null;state.researchReportCache=null;state.papersCache=null;
+                        state.runMode="";state.searchPrefs=null;state.searchPrefsForm=null;
+                        clearProjectFromStorage();stopPolling();updateProjectIdDisplay();renderSidebarNotes();renderSidebarDownload();
+                        const result=document.getElementById("create-result");if(result) clear(result);
+                        const url=new URL(location.href);url.searchParams.delete("project");history.replaceState(null,"",url);
+                    }
+                    showToast(response.message || "所选项目已移入可恢复归档。","success");
+                } catch(e) {showToast("删除失败："+e.message,"error");}
+                finally {deleting=false;paint();}
             });
-            card.appendChild(list);
-            content.appendChild(card);
+            card.replaceChildren(
+                el("div",{class:"project-library-heading"},[heading,search]),
+                el("div",{class:"project-selection-bar"},[el("label",{},[selectAll,"全选当前页"]),count,clearSelection,deleteButton]),
+                list,
+                el("div",{class:"project-library-footer"},[el("span",{class:"muted small"},batchSupported ? "仅查看不会启动任务；删除需勾选并确认。" : "当前后台尚未加载批量归档接口，请重启服务；查看与继续项目不受影响。"),el("div",{class:"btn-row"},[previous,pageLabel,next])]),
+            );
+            paint();
         } catch (e) {
-            // 静默
+            if(card.isConnected) card.replaceChildren(el("p",{class:"muted"},`项目列表读取失败：${e.message}`),el("button",{class:"btn btn-secondary btn-sm",onclick:()=>{card.remove();renderProjectList(content);}},"重试"));
         }
     }
 
@@ -1822,23 +1863,50 @@
         }
 
         const actions = el("div", { class: "btn-row mt-16" }, [
-            el("button", { class: "btn btn-success", onclick: () => startPipeline() }, "启动 Pipeline"),
+            el("button", { class: "btn btn-success", onclick: () => startPipeline() }, data.continuation?.label || "启动 / 继续研究任务"),
             el("button", { class: "btn btn-secondary", onclick: () => setActivePage("progress") }, "查看进度"),
         ]);
 
         container.appendChild(actions);
     }
 
+    function activateProject(data) {
+        stopPolling();
+        state.currentProjectId=data.project_id;
+        const url=new URL(window.location.href);url.searchParams.set("project",data.project_id);window.history.replaceState(null,"",url);
+        state.dashboardCache=null;state.researchReportCache=null;state.papersCache=null;
+        state.pollViewFingerprint=null;state.humanFingerprint=null;state.humanDraft="";
+        state.runMode=data.run_mode || "";state.domain=data.domain || "";
+        updateProjectIdDisplay();
+        state.statusCache=data;
+        state.workflowCache=data.workflow ? {projectId:data.project_id,...data.workflow} : null;
+        saveProjectToStorage(data.project_id);
+        updateBadges(data);renderSidebarNotes();renderSidebarDownload();startPolling();
+    }
+
     async function startPipeline(forceWriting) {
-        if (!state.currentProjectId) return;
+        const pid=state.currentProjectId;
+        if (!pid || state.resumingProjectId===pid) return;
+        state.resumingProjectId=pid;
         try {
-            const body = forceWriting ? { force_writing: true } : undefined;
-            await api("POST", `/api/projects/${state.currentProjectId}/run`, body);
-            showToast(forceWriting ? "已启动强制写作模式" : "Pipeline 已启动", "success");
-            setActivePage("progress");
+            const data = forceWriting ? await api("POST", `/api/projects/${pid}/run`, {force_writing:true})
+                : await api("POST", `/api/projects/${pid}/resume`);
+            if(pid!==state.currentProjectId) return;
+            await pollStatus();
+            showToast(data.message || "已继续当前任务", "success");
+            if(!forceWriting && ["record","results"].includes(data.action) && data.record_kind) {
+                startResearchRecord(data.record_kind,data.related_id || null);return;
+            }
+            if(!forceWriting && data.action==="review_record") {
+                const latest=await api("GET",`/api/projects/${pid}/workspace`);
+                if(pid!==state.currentProjectId) return;
+                const item=latest.workspace.items.find(record=>record.item_id===data.record_id);
+                if(item) {startResearchRecord(item.kind,null,item);return;}
+            }
+            setActivePage(forceWriting ? "progress" : data.page || "progress");
         } catch (e) {
-            showToast("启动失败：" + e.message, "error");
-        }
+            if(pid===state.currentProjectId) showToast("继续失败：" + e.message, "error");
+        } finally {if(state.resumingProjectId===pid) state.resumingProjectId=null;}
     }
 
     // ===== 方向推荐页面 =====
@@ -2142,6 +2210,7 @@
         // 顶部状态
         content.insertAdjacentHTML("beforeend",
             statusBanner(data.status, data.summary, data.error, data.recommendation, data.advice));
+        content.appendChild(renderContinuationCard(data));
 
         // 阶段进度条
         content.appendChild(renderStageProgress(data));
@@ -2154,12 +2223,12 @@
 
         // 操作区
         const actionCard = el("div", { class: "card" }, [
-            el("div", { class: "card-title" }, "Pipeline 操作"),
+            el("div", { class: "card-title" }, "当前主线与后台材料任务"),
             el("div", { class: "btn-row" }, [
                 el("button", {
                     class: "btn btn-success",
-                    onclick: () => data.run_mode === "topic_discovery" ? retryTopicDiscovery() : startPipeline(),
-                }, data.status === "created" ? "启动 Pipeline" : "继续 / 重启"),
+                    onclick: () => startPipeline(),
+                }, data.continuation?.label || "继续当前任务"),
                 el("button", {
                     class: "btn btn-secondary",
                     onclick: () => { pollStatus(); showToast("已刷新", "success"); },
@@ -2167,6 +2236,18 @@
             ]),
         ]);
         content.appendChild(actionCard);
+        const engine=data.workflow?.execution;
+        if(engine?.action==="resume" && data.continuation?.source==="research") {
+            const explicit=el("button",{class:"btn btn-secondary btn-sm",onclick:async()=>{
+                if(!confirm("继续后台材料生成任务？可能调用模型。不会更换已确认的研究主线，也不会自动执行实验。")) return;
+                try {
+                    if(engine.run_mode==="topic_discovery") await api("POST",`/api/projects/${state.currentProjectId}/run-topic-discovery`,{interest:data.topic,domain:data.domain});
+                    else await api("POST",`/api/projects/${state.currentProjectId}/run`,{});
+                    await pollStatus();
+                } catch(error) {showToast(error.message,"error");}
+            }},"继续后台材料生成（需模型调用）");
+            actionCard.append(el("p",{class:"muted small"},"研究主线与后台执行状态分开：已有记录可继续整理，也可明确选择恢复后台生成任务。"),explicit);
+        }
 
         // 等待实验回填的特殊操作区（规划型定位：实验已导出，等用户本地执行）
         if (data.status === "experiment_pending") {
@@ -2187,10 +2268,7 @@
                     class: "btn btn-secondary",
                     onclick: () => { pollStatus(); showToast("已刷新状态", "success"); },
                 }, "刷新状态"),
-                el("button", {
-                    class: "btn btn-warning",
-                    onclick: () => startPipeline(true),
-                }, "跳过实验强制写作"),
+                el("button", {class:"btn btn-secondary",onclick:()=>setActivePage("writing")}, "先整理写作骨架（不补造结果）"),
             ]);
             waitCard.appendChild(waitRow);
             content.appendChild(waitCard);
@@ -2205,10 +2283,7 @@
                     "或重新启动 Pipeline 从思路探讨阶段改进方案。"),
             ]);
             const failRow = el("div", { class: "btn-row" }, [
-                el("button", {
-                    class: "btn btn-warning",
-                    onclick: () => startPipeline(true),
-                }, "强制生成论文（撰写负面结果）"),
+                el("button", {class:"btn btn-secondary",onclick:()=>setActivePage("writing")}, "整理已有结果与局限"),
                 el("button", {
                     class: "btn btn-secondary",
                     onclick: () => {
@@ -3097,6 +3172,7 @@
         else {
             const records = el("section"); panel.appendChild(records);
             renderResearchRecords(records,["question"]);
+            if(state.workflowCache?.projectId===state.currentProjectId || state.statusCache?.workflow) return;
             const ideas = el("div", {class:"card"}, [el("h3",{class:"card-title"},"已有候选思路"),el("p",{class:"muted small"},"保留原系统产生的思路；它们不是已确认的问题或创新，需先核查文献与可行性。")]);
             panel.appendChild(ideas);
             const pid=state.currentProjectId;
@@ -3119,6 +3195,7 @@
 
     const RECORD_PAGES = {question:"gaps", plan:"experiments", result:"experiments", finding:"experiments", note:"notes", outline:"writing"};
     function readResearchFocus(pid) {
+        if(state.workflowCache?.projectId===pid) return state.workflowCache.focus || {};
         try { const value=JSON.parse(localStorage.getItem(`sra.research-focus.${pid}`) || "{}"); return value && typeof value==="object" ? value : {}; }
         catch (_) { return {}; }
     }
@@ -3126,7 +3203,7 @@
         try { localStorage.setItem(`sra.research-focus.${pid}`,JSON.stringify(focus)); } catch (_) { /* 本次选择仍可用。 */ }
     }
     function recordFormIsDirty() {
-        return !!document.querySelector('.research-record-form[data-dirty="true"]');
+        return !!document.querySelector('.research-record-form[data-dirty="true"], .project-brief-form[data-dirty="true"]');
     }
     function openResearchRecord(item) {
         if(item.kind==="note") {discussRecord(state.currentProjectId,item.item_id,`请围绕已保存的笔记「${item.title}」检查它与当前研究的关系。`);return;}
@@ -3222,10 +3299,11 @@
             function paintSummary(force=false) {
                 const status=state.statusCache?.project_id===pid ? state.statusCache : {};
                 const focus=readResearchFocus(pid);
-                const signature=JSON.stringify({status:status.status,error:status.error,experiments:status.counts?.experiments,focus,revision:workspace.revision});
+                const unified=status.workflow && status.workflow.revision>=(data.workflow?.revision || 0) ? status.workflow : data.workflow;
+                const signature=JSON.stringify({status:status.status,error:status.error,experiments:status.counts?.experiments,focus,revision:workspace.revision,workflow:unified});
                 if(!force && signature===lastManagementSignature) return;
                 lastManagementSignature=signature;
-                const info=window.SRA_PROJECT_MANAGEMENT.summarize(workspace,data.papers || [],status,focus);
+                const info=window.SRA_PROJECT_MANAGEMENT.summarize(workspace,data.papers || [],status,focus,unified);
                 summary.replaceChildren(el("p",{class:"project-goal"},baseline.goal || "尚未填写研究目标，可以先补充目标、时间与资源限制。"));
                 const states=el("div",{class:"project-state-grid"},[
                     el("div",{},[el("span",{class:"muted small"},"科研推进状态"),el("strong",{},info.researchState)]),
@@ -3234,7 +3312,7 @@
                 const resources=el("p",{class:"muted small"},`时间：${baseline.time_budget || "未填写"}；资源：${baseline.resources || "未填写"}`);summary.appendChild(resources);
                 const inventory=info.inventory;
                 const materials=el("details",{class:"project-materials"},el("summary",{},`已有材料 · ${inventory.papers} 篇论文 · ${inventory.plans} 条方案 · ${inventory.results} 条结果记录`));
-                materials.append(el("p",{class:"muted small"},`研究问题 ${inventory.questions} 条；研究判断 ${inventory.findings} 条；待复核 ${inventory.needsReview} 条。结果记录由用户提交，不等于系统独立复算；论文入库不代表全文已读。`),el("p",{class:"muted small"},`原流程另有 ${inventory.legacyExperiments} 条实验记录，保留原入口，不与新记录相加当作独立实验数量。`));summary.appendChild(materials);
+                materials.append(el("p",{class:"muted small"},`研究问题 ${inventory.questions} 条；研究判断 ${inventory.findings} 条；待复核 ${inventory.needsReview} 条。结果记录由用户提交，不等于系统独立复算；论文入库不代表全文已读。`),el("p",{class:"muted small"},`任务来源库保留 ${inventory.legacyExperiments} 条实验记录；来源与关联记录不会相加当作两个独立实验。`));summary.appendChild(materials);
                 const blockers=el("details",{class:"project-blockers"},el("summary",{},`当前阻碍与待核对事项 ${info.blockers.length} 项`));
                 const list=el("ul");info.blockers.forEach(text=>list.appendChild(el("li",{},text)));
                 blockers.appendChild(list);if(info.systemError) blockers.appendChild(el("p",{class:"text-danger small"},`另有后台错误：${info.systemError}。运行错误与科研设想被反驳不是同一回事。`));
@@ -3242,7 +3320,10 @@
                 const taskKey=`sra.project-tasks.hidden.${pid}`;
                 let hidden=[];try {const value=JSON.parse(localStorage.getItem(taskKey)||"[]");if(Array.isArray(value)) hidden=value.filter(x=>typeof x==="string");} catch (_) {}
                 const tasks=el("div",{class:"project-next-tasks"},el("h4",{},"下一步任务"));
-                info.tasks.filter(task=>!hidden.includes(task.id)).forEach(task=>{
+                const visibleTasks=info.tasks.filter(task=>!hidden.includes(task.id));
+                const moreTasks=el("details",{class:"project-more-tasks"},el("summary",{},`其他建议 ${Math.max(0,visibleTasks.length-1)} 项`));
+                const compact=!!box.closest(".overview-work-grid");
+                visibleTasks.forEach((task,index)=>{
                     const card=el("div",{class:"project-task"},[el("strong",{},task.title),el("p",{},task.text)]);
                     const go=()=>{
                         if(task.action==="brief") {editor.open=true;inputs.goal.focus();return;}
@@ -3258,10 +3339,11 @@
                         el("button",{class:"btn btn-secondary btn-sm",onclick:go},"去处理"),
                         el("button",{class:"btn btn-secondary btn-sm",onclick:discuss},"讨论调整"),
                         el("button",{class:"project-muted-button",title:"仅在本机隐藏这条建议，不代表任务已完成",onclick:()=>{hidden.push(task.id);try {localStorage.setItem(taskKey,JSON.stringify(hidden));} catch (_) {}paintSummary(true);}},"暂不提醒"),
-                    ]));tasks.appendChild(card);
+                    ]));(compact && index>0 ? moreTasks : tasks).appendChild(card);
                 });
+                if(compact && visibleTasks.length>1) tasks.appendChild(moreTasks);
                 if(hidden.length) tasks.appendChild(el("button",{class:"project-muted-button",onclick:()=>{try {localStorage.removeItem(taskKey);} catch (_) {}paintSummary(true);}},"恢复本机隐藏的建议"));
-                tasks.appendChild(el("p",{class:"muted small"},"处理按钮只打开现有入口，不自动保存记录或调用模型；暂不提醒只是本机偏好，不会消除阻碍或标记研究已完成。"));summary.appendChild(tasks);
+                tasks.appendChild(el("p",{class:"muted small"},compact ? "建议操作不会自动执行实验，也不会标记研究完成。" : "处理按钮只打开现有入口，不自动保存记录或调用模型；暂不提醒只是本机偏好，不会消除阻碍或标记研究已完成。"));summary.appendChild(tasks);
             }
             box.refreshManagement=()=>paintSummary();
             paintSummary();
@@ -3279,16 +3361,31 @@
         const load=knownData ? Promise.resolve(knownData) : api("GET",`/api/projects/${pid}/workspace`);
         load.then(data=>{
             if(pid!==state.currentProjectId || !box.isConnected) return;
+            if(data.workflow) focus=data.workspace.focus;
+            async function choose(next) {
+                if(!data.workflow) {focus=next;rememberResearchFocus(pid,focus);paint();return;}
+                box.querySelectorAll("select,button").forEach(input=>input.disabled=true);
+                try {
+                    const updated=await api("PUT",`/api/projects/${pid}/workspace/focus`,{expected_revision:data.workspace.revision,focus:next});
+                    if(pid!==state.currentProjectId || !box.isConnected) return;
+                    data=updated;focus=updated.workspace.focus;rememberResearchFocus(pid,focus);
+                    state.workflowCache={projectId:pid,...updated.workflow};
+                    if(state.statusCache?.project_id===pid) state.statusCache.workflow=updated.workflow;
+                    window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid,source:"focus"}}));
+                } catch(error) {showToast("主线未切换："+error.message,"error");paint();}
+            }
             function paint() {
-                const flow=window.SRA_RESEARCH_FLOW.analyze(data.workspace,data.papers || [],focus);
-                box.replaceChildren(el("h3",{class:"card-title"},"研究主线"),el("p",{class:"muted small"},"按同一个问题核对方案、结果与判断。这里只检查记录衔接，不代表科学验证；不会启动或更改后台实验。当前选择用于记录整理和科研指导，不会替换后台任务主题。"));
+                const flow=data.workflow?.flow || window.SRA_RESEARCH_FLOW.analyze(data.workspace,data.papers || [],focus);
+                const compact=!!box.closest(".overview-work-grid");
+                box.replaceChildren(el("h3",{class:"card-title"},"研究主线"),el("p",{class:"muted small"},compact ? "围绕同一问题关联方案、结果与判断；仅核对记录，不代表科学验证，不会启动实验或替换后台主题。" : "按同一个问题核对方案、结果与判断。这里只检查记录衔接，不代表科学验证；不会启动或更改后台实验。当前选择用于记录整理和科研指导，不会替换后台任务主题。"));
+                if(!compact) box.appendChild(el("p",{class:"muted small"},`当前记录主线：${flow.question?.title || "尚未选择问题"} → ${flow.plan?.title || "尚未选择方案"}；可用结果 ${flow.validResults.length} 条。原流程已有的文献、方案和稿件保留，无需为查看它们重复新建记录。`));
                 const fields=el("div",{class:"research-flow-selectors"});
                 const question=el("select",{"aria-label":"当前研究问题"},el("option",{value:""},flow.questions.length ? "请选择本次推进的问题" : "尚无已保存的问题"));
                 flow.questions.forEach(item=>question.appendChild(el("option",{value:item.item_id},item.title+(item.needs_review ? "（待复核）" : ""))));
                 question.value=flow.question?.item_id || "";
                 question.onchange=()=>{
                     if(recordFormIsDirty()) {question.value=flow.question?.item_id || "";showToast("请先保存当前记录，再切换研究问题。","warning");return;}
-                    focus={question:question.value,plan:""};rememberResearchFocus(pid,focus);paint();
+                    choose({question:question.value,plan:""});
                 };
                 fields.appendChild(el("label",{},["当前研究问题",question]));
                 if(flow.plans.length>1) {
@@ -3297,7 +3394,7 @@
                     plan.value=flow.plan?.item_id || "";
                     plan.onchange=()=>{
                         if(recordFormIsDirty()) {plan.value=flow.plan?.item_id || "";showToast("请先保存当前记录，再切换研究方案。","warning");return;}
-                        focus={question:flow.question.item_id,plan:plan.value};rememberResearchFocus(pid,focus);paint();
+                        choose({question:flow.question.item_id,plan:plan.value});
                     };
                     fields.appendChild(el("label",{},["当前研究方案",plan]));
                 }
@@ -3320,7 +3417,7 @@
                     pending.forEach(item=>review.appendChild(el("button",{class:"research-record-link",onclick:()=>openResearchRecord(item)},`${RECORD_LABELS[item.kind]}：${item.title}`)));
                     box.appendChild(review);
                 }
-                if(!data.workspace.items.length) box.appendChild(el("p",{class:"muted small"},"原流程的论文、方法文档和实验任务保留原入口；这里不会自动复制旧产物或将它们当作已确认的新记录。"));
+                if(!data.workspace.items.length && !compact) box.appendChild(el("p",{class:"muted small"},"已有论文、方法与任务保留；可在下方直接关联，确认后纳入同一主线，不会自动改成已验证。"));
                 const signature=`${pid}:${flow.question?.item_id || ""}`;
                 if(state.publishedResearchFocus!==signature) {
                     state.publishedResearchFocus=signature;
@@ -3335,15 +3432,64 @@
         window.dispatchEvent(new CustomEvent("sra:discuss",{detail:{projectId:pid,itemId,message}}));
     }
 
+    function renderAvailableMaterials(data,kinds,pid) {
+        const box=el("section",{class:"card source-materials","aria-label":"已有材料关联"});
+        const types=[];
+        if(kinds.includes("question")) types.push("idea","gap");
+        if(kinds.includes("plan")) types.push("method","experiment_plan");
+        if(kinds.includes("result")) types.push("experiment_result");
+        const materials=(data.workflow.materials || []).filter(source=>types.includes(source.kind));
+        const group=el("details",{},el("summary",{},`已有材料 · ${materials.length} 项可核对来源`));
+        group.open=materials.length>0 && (!data.workflow.flow.question || kinds.includes("plan") && !data.workflow.flow.plan);
+        group.appendChild(el("p",{class:"muted small"},"原流程的思路、方法与实验记录保留原件。核对后可直接关联到当前主线；关联不会执行实验、确认创新或重复计算产物数量。"));
+        if(!materials.length) group.appendChild(el("p",{class:"muted small"},"暂无对应材料。可以手动整理，或在任务进度中查看后台材料生成。"));
+        const labels={idea:"候选思路",gap:"文献问题",method:"方法文档",experiment_plan:"实验任务",experiment_result:"结果记录"};
+        materials.forEach(source=>{
+            const item=el("details",{class:"source-material","data-source-kind":source.kind,"data-source-id":source.source_id},[
+                el("summary",{},`${labels[source.kind]} · ${source.title}${source.linked_item_id ? source.needs_update ? "（来源已更新，待复核）" : "（已关联）" : ""}`),
+                el("p",{class:"muted small"},source.warning || "已有生成材料，仍需核对依据与可实施性。"),
+                el("pre",{class:"research-record-text"},source.content || "正文为空，请先补全来源材料。"),
+            ]);
+            if(source.truncated) item.appendChild(el("p",{class:"text-warning small"},"材料较长，此处及关联记录仅保留前 16000 字符；完整内容以原始文档为准，来源与版本仍保留。"));
+            const kind=source.kind==="experiment_result" ? "result" : ["method","experiment_plan"].includes(source.kind) ? "plan" : "question";
+            const related=kind==="plan" ? data.workflow.flow.question : kind==="result" ? data.workflow.flow.plan : null;
+            const wrongTask=kind==="result" && (related?.source_ref?.kind!=="experiment_plan" || related.source_ref.source_id!==source.source_id);
+            const linked=data.workspace.items.find(record=>record.item_id===source.linked_item_id);
+            const viewLinked=linked && !source.needs_update && !linked.needs_review;
+            const button=el("button",{class:"btn btn-secondary btn-sm"},viewLinked ? "查看已关联记录" : source.needs_update ? "核对后更新关联记录" : `确认关联为${RECORD_LABELS[kind]}`);
+            button.disabled=!viewLinked && (!source.available || source.importable===false || kind!=="question" && !related || related?.needs_review || wrongTask);
+            if(button.disabled) item.appendChild(el("p",{class:"muted small"},wrongTask ? "请先选择同一实验任务对应的方案，再关联这条结果。" : kind!=="question" && !related ? "先在上方明确当前研究问题或方案。" : "来源不可用或主线待复核，请先处理。"));
+            button.onclick=async()=>{
+                if(viewLinked) {openResearchRecord(linked);return;}
+                if(recordFormIsDirty()) {showToast("请先保存或取消当前输入，再关联已有材料。","warning");return;}
+                if(!confirm(`确认将「${source.title}」关联为${RECORD_LABELS[kind]}？\n${related ? `关联到：${related.title}\n` : ''}原材料与历史版本保留，不会执行实验或将论断标为已验证。`)) return;
+                button.disabled=true;
+                try {
+                    const updated=await api("POST",`/api/projects/${pid}/workspace/link-material`,{expected_revision:data.workspace.revision,kind:source.kind,source_id:source.source_id,fingerprint:source.fingerprint,related_id:related?.item_id || null,confirmed:true});
+                    if(pid!==state.currentProjectId) return;
+                    state.workspaceCounts=updated.counts;state.workspaceCountsProjectId=pid;
+                    state.workflowCache={projectId:pid,...updated.workflow};
+                    if(state.statusCache?.project_id===pid) state.statusCache.workflow=updated.workflow;
+                    showToast("已关联到当前研究主线；原材料保留。","success");
+                    window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid,source:"material-link"}}));
+                } catch(error) {showToast("未关联："+error.message,"error");button.disabled=false;}
+            };
+            item.appendChild(button);group.appendChild(item);
+        });
+        box.appendChild(group);return box;
+    }
+
     async function renderResearchRecords(content,kinds) {
         const pid=state.currentProjectId;
         content.replaceChildren(el("p",{class:"muted small"},"加载已保存的研究记录…"));
         try {
             const data=await api("GET",`/api/projects/${pid}/workspace`);
+            if(data.workflow && pid===state.currentProjectId) state.workflowCache={projectId:pid,...data.workflow};
             window.dispatchEvent(new CustomEvent("sra:workspace-loaded",{detail:{projectId:pid,counts:data.counts}}));
             clear(content);
             const workspace=data.workspace;
             if(!kinds.includes("outline")) renderResearchFlow(content,data);
+            if(data.workflow && !kinds.includes("outline")) content.appendChild(renderAvailableMaterials(data,kinds,pid));
             const card=el("div",{class:"card research-records"},[
                 el("h3",{class:"card-title"},"已保存的"+kinds.map(k=>RECORD_LABELS[k]).join(" · ")),
                 el("p",{class:"muted small"},"这里汇集手动保存和对话中明确采纳的记录，未采纳的模型建议不会自动写入。保存不会启动后台任务，也不会把旧论断自动改成已验证。"),
@@ -3354,8 +3500,9 @@
             if(!records.length) card.appendChild(el("p",{class:"list-empty"},"还没有保存对应记录。可在下方手动整理，或先与右侧科研指导讨论后再采纳。"));
             records.slice().reverse().forEach(item=>{
                 const stale=item.status!=="active" || item.needs_review;
-                const label=item.status!=="active" ? "历史版本" : item.needs_review ? "依据已变化，待复核" : "已保存，非独立核验";
-                const d=el("details",{class:"research-record","data-record-id":item.item_id},[el("summary",{},`${RECORD_LABELS[item.kind]} · ${item.title}`),el("p",{class:stale ? "text-warning small" : "muted small"},label),el("p",{class:"research-record-text"},item.content)]);
+                const label=item.status!=="active" ? "历史版本" : item.needs_review ? "依据已变化，待复核" : item.source_ref ? "已关联已有材料，非独立核验" : "已保存，非独立核验";
+                const body=el("div",{class:"research-record-text"});window.SRA_DOCUMENT.render(body,item.content);
+                const d=el("details",{class:"research-record","data-record-id":item.item_id},[el("summary",{},`${RECORD_LABELS[item.kind]} · ${item.title}`),el("p",{class:stale ? "text-warning small" : "muted small"},label),body]);
                 if(item.result_status) d.appendChild(el("p",{class:"small"},`运行状态：${({completed:"已完成",failed:"运行失败",inconclusive:"无法定论"})[item.result_status]}`));
                 if(item.metrics && Object.keys(item.metrics).length) d.appendChild(el("pre",{class:"code-block"},JSON.stringify(item.metrics,null,2)));
                 if(item.assessment) d.appendChild(el("p",{class:"small"},`用户判断：${({supports:"支持设想",refutes:"不支持设想",inconclusive:"无法定论"})[item.assessment]}`));
@@ -3468,7 +3615,9 @@
             if(!data.artifacts.length) artifacts.appendChild(el("p",{class:"list-empty"},"暂无已保存的稿件或修改意见。可以先保存写作提纲，待证据充分后再整理正文。"));
             data.artifacts.forEach(a=>{
                 const item=el("details",{class:"research-record"},[el("summary",{},`${a.artifact_type==="paper_draft" ? "稿件" : "修改意见"} · ${a.title} · v${a.version}`)]);
-                item.appendChild(a.available ? el("pre",{class:"research-record-text"},a.content) : el("p",{class:"text-warning"},a.issue));
+                const body=el("div",{class:"research-record-text"});
+                if(a.available) window.SRA_DOCUMENT.render(body,a.content);
+                item.appendChild(a.available ? body : el("p",{class:"text-warning"},a.issue));
                 if(a.truncated) item.appendChild(el("p",{class:"muted small"},"正文较长，这里展示前 20 万字符。完整文件可通过原有产物下载查看。"));
                 artifacts.appendChild(item);
             });
@@ -4045,7 +4194,7 @@
             clear(content);
             content.appendChild(el("div", { class: "page-header" }, [
                 el("h2", { class: "page-title" }, "方案与实验"),
-                el("p", { class: "page-desc" }, `先明确比较方法、数据、指标与判断标准，再执行和登记实际结果。下方保留原有 ${data.experiments.length} 条实验记录。方案和预期不能代替结果。`),
+                el("p", { class: "page-desc" }, `围绕当前问题确认方案，外部执行后回填结果并记录判断。已有 ${data.experiments.length} 条任务来源可关联；方案和预期不能代替结果。`),
             ]));
             const records = el("section", {"aria-label":"研究方案与实际结果"});
             content.appendChild(records);
@@ -4099,18 +4248,18 @@
         const pid = state.currentProjectId;
         const card = el("div", { class: "card" });
         card.appendChild(el("div", { class: "card-title" },
-            "📋 实验任务说明书（系统只给任务，不代跑、不含代码）"));
+                "任务来源包（可下载，系统不代跑实验）"));
         const planCount = (tasks.plan && tasks.plan.experiments && tasks.plan.experiments.length) || 0;
         card.appendChild(el("p", { class: "muted small" },
             `共 ${planCount} 个实验任务，已导出到项目 ${tasks.export_dir} 目录`
             + "（experiment_plan.json + README.md）。按说明书的目标/步骤/判定标准"
             + "在本地用你自己的脚本或环境执行，跑完后在下方回填结果。"));
 
-        const readmePre = el("pre", {
-            class: "code-block",
-            style: "display:none; max-height:420px; overflow:auto; white-space:pre-wrap;",
+        const readmePre = el("div", {
+            class: "research-document",
+            style: "display:none; max-height:520px; overflow:auto;",
         });
-        readmePre.textContent = tasks.readme;
+        window.SRA_DOCUMENT.render(readmePre,tasks.readme);
 
         const row = el("div", { class: "btn-row mt-8" });
         row.appendChild(el("button", {
@@ -4129,7 +4278,7 @@
         card.appendChild(readmePre);
 
         // ===== 结果回填 =====
-        const backfillBtn = el("button", { class: "btn mt-8" }, "回填实验结果");
+        const backfillBtn = el("button", { class: "btn btn-secondary mt-8" }, "批量导入任务结果（兼容 JSON）");
         const backfillBox = el("div", { style: "display:none;" });
         const ta = el("textarea", {
             class: "textarea",
@@ -4158,6 +4307,7 @@
                     { results_json: ta.value });
                 msg.textContent = res.message || "回填完成";
                 showToast(res.message || "回填成功", "success");
+                window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid,source:"results-import"}}));
                 ta.value = "";
                 const next = el("button", {class:"btn btn-secondary mt-8", onclick:()=>{if(pid===state.currentProjectId) startPipeline();}}, "复核结果并继续");
                 msg.appendChild(next);

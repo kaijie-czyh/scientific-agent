@@ -35,7 +35,8 @@ from core.artifacts import ArtifactContentStore, ArtifactManager, ProvenanceVali
 from core.config import GlobalConfig, get_config
 from core.knowledge import KnowledgeStore
 from core.llm import LLMRegistry
-from core.orchestration.context import ExecutionContext
+from core.orchestration.context import ExecutionContext, ContextKey
+from core.experiment_results import experiment_signature
 from core.orchestration.graph import Graph, GraphRunner
 from core.orchestration.node import HumanRequest, HumanResponse, NodeResult, NodeStatus
 from core.state.lifecycle import LifecycleStage, StageStatus
@@ -226,7 +227,8 @@ class Pipeline:
         if not ctx.has(IDEATION_IDEA_IDS):
             ideas = [i.idea_id for i in store.list_ideas() if i.status != "rejected"]
             ctx.set(IDEATION_IDEA_IDS, ideas)
-            ctx.set(IDEATION_VALIDATED_IDEA_IDS, ideas)
+        if not ctx.has(IDEATION_VALIDATED_IDEA_IDS):
+            ctx.set(IDEATION_VALIDATED_IDEA_IDS, [i.idea_id for i in store.list_ideas() if i.status in ("validated", "adopted")])
         if not ctx.has(DESIGN_CLAIM_IDS):
             ctx.set(DESIGN_CLAIM_IDS, [c.claim_id for c in store.list_claims() if c.status.value != "superseded"])
         manager = ctx.get(ARTIFACT_MANAGER)
@@ -236,7 +238,7 @@ class Pipeline:
             if methods:
                 ctx.set(DESIGN_METHOD_CONTENT, manager.read_content(methods[-1]) or "")
                 ctx.set(DESIGN_METHOD_ARTIFACT_ID, methods[-1].artifact_id)
-        if not ctx.has(EXPERIMENT_IDS):
+        if not ctx.has(EXPERIMENT_IDS) and not ctx.has(EXPERIMENT_CONFIGS):
             experiments = store.list_experiments()
             ctx.set(EXPERIMENT_IDS, [e.experiment_id for e in experiments])
             ctx.set(EXPERIMENT_CONFIGS, [e.config for e in experiments])
@@ -617,6 +619,8 @@ class Pipeline:
         Returns:
             PipelineResult
         """
+        if force_writing and not self.config.dry_run:
+            raise ValueError("真实模式不能通过 force_writing 绕过结果审核；可先保存写作骨架或回填真实结果")
         # 初始化或恢复
         if resume:
             session, ctx = self.resume_project(project_id, topic, domain)
@@ -653,6 +657,24 @@ class Pipeline:
                 if stage != LifecycleStage.EXPERIMENT or session.is_stage_done(LifecycleStage.WRITING):
                     result.completed_stages.append(stage)
                     continue
+                signature_key = ContextKey[str]("experiment.review_fingerprint")
+                current_signature = experiment_signature(ctx.get(KNOWLEDGE_STORE), ctx.get(EXPERIMENT_IDS, []))
+                if (session.status_of(LifecycleStage.WRITING) != StageStatus.NOT_STARTED
+                        and ctx.get(signature_key) == current_signature
+                        and (ctx.get(EXPERIMENT_OUTCOME, {}) or {}).get("ready_for_writing")):
+                    # Preserve the writing cursor/history and draft when inputs
+                    # have not changed. Re-reviewing here would erase that cursor.
+                    result.completed_stages.append(stage)
+                    continue
+                if session.status_of(LifecycleStage.WRITING) != StageStatus.NOT_STARTED:
+                    from stages.common import WRITING_DRAFT_CONTENT, WRITING_OUTLINE
+                    store = ctx.get(KNOWLEDGE_STORE)
+                    draft = ctx.get(WRITING_DRAFT_CONTENT, "")
+                    if draft:
+                        versions = store.get_kv("writing.recovered_draft_history", []) or []
+                        if not versions or versions[-1].get("content") != draft:
+                            versions.append({"content": draft, "outline": ctx.get(WRITING_OUTLINE, {}), "reason": "结果发生变化或旧版缺少复核指纹，恢复前保留未确认草稿"})
+                            store.save_kv("writing.recovered_draft_history", versions)
                 # 实验规划已经完成，回填后只重做结果复核，不重新生成/覆盖任务包。
                 from stages.experiment.agents import AnomalyCheckAgent, ClaimVerifyAgent, ExperimentOutcomeAssessAgent
                 reviewers = (AnomalyCheckAgent("anomaly_check"), ClaimVerifyAgent("claim_verify"), ExperimentOutcomeAssessAgent("experiment_outcome_assess"))
@@ -712,6 +734,8 @@ class Pipeline:
             # ===== 关键：experiment 后判断是否进入 writing =====
             if stage == LifecycleStage.EXPERIMENT:
                 outcome = ctx.get(EXPERIMENT_OUTCOME, {})
+                ctx.set(ContextKey[str]("experiment.review_fingerprint"), experiment_signature(ctx.get(KNOWLEDGE_STORE), ctx.get(EXPERIMENT_IDS, [])))
+                save_context(ctx, ctx.get(KNOWLEDGE_STORE), self.config.dry_run)
                 result.experiment_outcome = outcome
                 if force_writing:
                     # force_writing：绕过实验成败判断，强制进入 writing（架构验证用）
@@ -925,7 +949,7 @@ class Pipeline:
         # 设置研究兴趣
         ctx.set(TOPIC_DISCOVERY_INTEREST, interest)
         # 设置研究领域（推荐主题时按该领域给出具体的研究对象与切入点）
-        ctx.set(PROJECT_DOMAIN, domain)
+        ctx.set(PROJECT_DOMAIN, domain or ctx.get(PROJECT_DOMAIN, ""))
 
         # 运行 topic_discovery 子图
         from stages.topic_discovery.graph import build_topic_discovery_graph
@@ -955,6 +979,10 @@ class Pipeline:
         ctx.current_stage = "topic_discovery"
 
         if resume and recover_stage == "topic_discovery" and recover_node in graph.nodes:
+            last = (ctx.history() or [{}])[-1]
+            if last.get("node_id") == recover_node and last.get("status") == NodeStatus.SUCCESS.value:
+                successors = graph.successors(recover_node)
+                recover_node = successors[0] if successors else None
             runner.start_at(recover_node)
         else:
             runner.start()
@@ -971,6 +999,7 @@ class Pipeline:
                 req = runner.pending_human_request()
                 result.status = "pending_human"
                 result.summary = "方向推荐等待用户选择主题"
+                result.node_history = ctx.history()
                 return result
             req = runner.pending_human_request()
             resp = human_callback(req)

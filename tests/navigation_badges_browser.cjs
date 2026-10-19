@@ -84,7 +84,7 @@ const assert = require('node:assert/strict');
         await page.evaluate(pid => window.dispatchEvent(new CustomEvent('sra:records-changed', {detail: {projectId: pid}})), a);
         await waitForWorkspace;
         await page.locator('#nav [data-page="create"]').click();
-        await page.locator('.project-switch-item').filter({hasText: '空项目测试B'}).click();
+        await page.locator('.project-library-row').filter({hasText: '空项目测试B'}).locator('.project-title-link').click();
         await expectBadges(0, 0);
         releaseWorkspace();
         await page.evaluate(pid => window.dispatchEvent(new CustomEvent('sra:workspace-loaded', {detail: {projectId: pid, counts: {question: 99, plan: 99, result: 99}}})), a);

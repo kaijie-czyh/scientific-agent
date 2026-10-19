@@ -349,20 +349,7 @@ class GraphRunner:
                 self._state.current_node_id = next_nodes[0]
 
     def _handle_failure(self, node: Node, result: NodeResult) -> None:
-        """处理节点失败。尝试回退到最近的检查点，否则停止。"""
-        if self._state.last_checkpoint_node_id is not None:
-            # 从 context 取检查点快照（由 CheckpointNode 写入）
-            from core.orchestration.context import ContextKey
-
-            snapshot = self._ctx.get(
-                ContextKey[dict](f"checkpoint.{self._state.last_checkpoint_node_id}")
-            )
-            if snapshot is not None:
-                self._ctx.restore(snapshot)
-                self._state.current_node_id = self._state.last_checkpoint_node_id
-                self._state.failed_nodes.clear()
-                return
-        # 无检查点，停止
+        """保留失败节点及已完成材料，等待用户重试；回滚只由显式操作触发。"""
         self._state.current_node_id = None
 
     def _rollback_to_checkpoint(self) -> None:

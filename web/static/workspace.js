@@ -181,7 +181,8 @@
         const records = activeItems().filter(i => kinds.includes(i.kind)).slice().reverse();
         records.forEach(item => {
             const card = el("article", { class: "card" });
-            card.append(el("div", { class: "card-heading" }, [el("span", { class: "tag" }, KINDS[item.kind]), item.needs_review ? el("span", { class: "tag warning" }, "依据变化 · 需要复核") : null]), el("h3", {}, item.title), el("div", { class: "record-content" }, item.content));
+            const body=el("div",{class:"record-content"}); window.SRA_DOCUMENT.render(body,item.content);
+            card.append(el("div", { class: "card-heading" }, [el("span", { class: "tag" }, KINDS[item.kind]), item.needs_review ? el("span", { class: "tag warning" }, "依据变化 · 需要复核") : null]), el("h3", {}, item.title), body);
             if (item.result_status) card.append(el("p", { class: "small" }, `用户提交的状态：${RUN_STATUS[item.result_status]}`), el("pre", { class: "metrics" }, JSON.stringify(item.metrics, null, 2)));
             if (item.assessment) card.append(el("p", { class: "small" }, `用户判断：${ASSESSMENT[item.assessment]}；未经系统独立验证。`));
             const sourceNames = item.paper_ids.map(id => state.data.papers.find(p => p.paper_id === id)?.title || id);
@@ -253,7 +254,8 @@
         (state.data.starters[state.area] || []).forEach(text => $("guide-starters").append(el("button", { type: "button", onclick: () => { $("guide-input").value = text; sessionStorage.setItem(chatKey(), text); $("guide-input").focus(); } }, text)));
         if (!workspace().messages.length) thread.append(el("div", { class: "message" }, "你可以用对话补充条件、理解论文、比较问题、检查方案或组织写作。点击中间的“围绕这条讨论”后，我会将它纳入上下文。"));
         workspace().messages.forEach(message => {
-            const box = el("div", { class: `message ${message.role}` }, [el("span", { class: "message-label" }, `${message.role === "user" ? "你" : message.mode === "rules" ? "科研指导 · 规则模式" : "科研指导"} · ${AREAS[message.area][0]}`), message.content]);
+            const body=el("div");window.SRA_DOCUMENT.render(body,message.content);
+            const box = el("div", { class: `message ${message.role}` }, [el("span", { class: "message-label" }, `${message.role === "user" ? "你" : message.mode === "rules" ? "科研指导 · 规则模式" : "科研指导"} · ${AREAS[message.area][0]}`), body]);
             message.cited_paper_ids.forEach(id => box.append(el("span", { class: "source" }, `来源：${state.data.papers.find(p => p.paper_id === id)?.title || id}`)));
             message.questions.forEach(text => box.append(el("p", { class: "small" }, text)));
             message.suggestion_ids.forEach(id => {

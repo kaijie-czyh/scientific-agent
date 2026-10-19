@@ -25,6 +25,8 @@ htmlcov/
 # 项目数据（每个科研项目独立目录，含知识库/快照/产出物，不入库）
 projects/
 !projects/.gitkeep
+.project-trash/
+.project-backups/
 
 # 配置中的敏感凭据
 .env
@@ -58,7 +60,7 @@ _test_api.py
 # 临时调试脚本 / 验证脚本 / Edge 测试 profile
 _*.py
 _cdp_*.py
-_edge_*/ 
+_edge_*/
 *.log
 diag_*.py
 verify_*.py

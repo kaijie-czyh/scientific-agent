@@ -34,9 +34,9 @@
         $("rg-records-tab").setAttribute("aria-selected",String(tab==="records"));
     }
     function richText(text) {
-        // 只解析加粗，始终使用文本节点；不将模型文本作为 HTML 插入。
         const n=el("div","rg-message-text");
-        String(text).split(/(\*\*[^*]+\*\*)/g).forEach(p => n.append(p.startsWith("**") && p.endsWith("**") ? el("strong","",p.slice(2,-2)) : document.createTextNode(p)));
+        // Shared renderer sanitizes Markdown before rendering local SVG equations.
+        window.SRA_DOCUMENT.render(n,text);
         return n;
     }
     function renderContext() {

@@ -12,7 +12,7 @@ from pydantic import Field
 from core.llm import LLMRegistry
 from core.knowledge.schema import ArtifactType
 from core.workspace.guide import STARTERS, build_guide_context, generate_guidance, rule_guidance
-from core.workspace.schema import Area, Brief, Contract, ItemInput
+from core.workspace.schema import Area, Brief, Contract, ItemInput, ResearchFocus
 from core.workspace.service import RevisionConflict, WorkspaceError, WorkspaceService
 from core.research_scope import normalize_public_domain, is_public_domain, SCOPE_NOTICE
 
@@ -33,6 +33,20 @@ class ApplyRequest(Contract):
     expected_revision: int = Field(ge=0)
 
 
+class FocusRequest(Contract):
+    expected_revision: int = Field(ge=0)
+    focus: ResearchFocus
+
+
+class LinkMaterialRequest(Contract):
+    expected_revision: int = Field(ge=0)
+    kind: Literal["idea","gap","method","experiment_plan","experiment_result"]
+    source_id: str = Field(min_length=1,max_length=200)
+    fingerprint: str = Field(min_length=64,max_length=64)
+    related_id: str | None = None
+    confirmed: Literal[True]
+
+
 class GuideRequest(Contract):
     expected_revision: int = Field(ge=0)
     area: Area
@@ -42,7 +56,7 @@ class GuideRequest(Contract):
     reading_purpose: Literal["orientation", "method", "comparison", "innovation", "troubleshooting"] = "orientation"
 
 
-def build_workspace_router(config, require_project, registry_factory=None) -> APIRouter:
+def build_workspace_router(config, require_project, registry_factory=None, workflow_provider=None) -> APIRouter:
     router = APIRouter(prefix="/api/projects", tags=["research-workspace"])
 
     def service_for(project_id: str):
@@ -57,11 +71,13 @@ def build_workspace_router(config, require_project, registry_factory=None) -> AP
         return service, project
 
     def view(service, project, workspace=None):
-        return {
-            **service.view(workspace), "project": {"topic": project.topic, "domain": project.domain},
+        workflow = workflow_provider(project) if workflow_provider else None
+        result = {
+            **service.view(workspace,workflow=workflow), "project": {"topic": project.topic, "domain": project.domain},
             "guide_mode": "rules" if config.dry_run else "model", "starters": STARTERS,
             "research_scope": {"supported": is_public_domain(project.domain), "notice": SCOPE_NOTICE},
         }
+        return result
 
     def fail(exc):
         raise HTTPException(status_code=409 if isinstance(exc, RevisionConflict) else 422, detail=str(exc)) from exc
@@ -125,11 +141,32 @@ def build_workspace_router(config, require_project, registry_factory=None) -> AP
     @router.post("/{project_id}/workspace/items")
     def add_item(project_id: str, request: ItemRequest):
         service, project = service_for(project_id)
+        if request.item.kind=="result" and getattr(project,"thread",None) is not None and project.thread.is_alive():
+            raise HTTPException(status_code=409,detail="后台任务仍在运行或等待确认，结果尚未保存；请在任务结束后回填，避免覆盖正在使用的实验记录。")
         try:
             workspace = service.add_item(request.item, request.expected_revision)
         except WorkspaceError as exc:
             fail(exc)
         return view(service, project, workspace)
+
+    @router.put("/{project_id}/workspace/focus")
+    def save_focus(project_id: str, request: FocusRequest):
+        service, project = service_for(project_id)
+        try:
+            workspace = service.save_focus(request.focus,request.expected_revision)
+        except WorkspaceError as exc:
+            fail(exc)
+        return view(service,project,workspace)
+
+    @router.post("/{project_id}/workspace/link-material")
+    def link_material(project_id: str, request: LinkMaterialRequest):
+        service, project = service_for(project_id)
+        try:
+            workspace = service.link_material(request.kind,request.source_id,request.fingerprint,
+                                              request.related_id,request.expected_revision)
+        except WorkspaceError as exc:
+            fail(exc)
+        return view(service,project,workspace)
 
     @router.post("/{project_id}/workspace/guide")
     def guide(project_id: str, request: GuideRequest):

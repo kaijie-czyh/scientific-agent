@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+from core.document_math import MATH_DOCUMENT_GUIDE
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -335,7 +336,7 @@ class MethodFormalizeAgent(AgentNode):
                         "你是科研方法形式化助手。基于已分解的原子概念与公式↔代码映射，"
                         "整合为完整的方法文档（含数学公式与算法伪代码），"
                         "结构：动机 → 核心概念定义 → 算法伪代码 → 复杂度分析。"
-                        "保持公式与代码的对应关系，输出 Markdown 格式。"
+                        "保持公式与代码的对应关系，输出 Markdown 格式。" + MATH_DOCUMENT_GUIDE +
                         "若项目明确为复现或验收，只整理已有算法与可执行协议，不发明新算法或证明新理论；"
                         "每节只保留执行和审核所需内容，全文控制在1800汉字及必要公式、表格和简短伪代码以内。"
                     ),
@@ -357,7 +358,7 @@ class MethodFormalizeAgent(AgentNode):
                         "- 用对比表给出：方法 | 核心思想 | 优势 | 局限 | 与本文方法的关系\n"
                         "- 明确说明本文方案的动机：为什么它在这些已有方法之上更优或更适配\n"
                         "## 4. 核心公式设计\n"
-                        "- 逐个给出关键公式（LaTeX，用 $$ ... $$ 包裹），每个公式前有文字说明设计动机\n"
+                        "- 逐个给出关键公式（LaTeX，用 \\[ ... \\] 包裹），每个公式前有文字说明设计动机\n"
                         "- 公式之间有逻辑递进关系\n"
                         "- 关键参数给出推荐取值或取值范围\n"
                         "## 5. 算法伪代码\n"

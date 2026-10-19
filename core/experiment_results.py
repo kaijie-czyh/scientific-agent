@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -11,6 +13,21 @@ def has_real_metrics(metrics) -> bool:
         isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
         for value in metrics.values()
     )
+
+
+def experiment_signature(store, experiment_ids) -> str:
+    """Detect changed inputs, not scientific validity; exclude unrelated legacy tasks."""
+    rows = []
+    from core.knowledge.store import StoreError
+    for experiment_id in sorted(experiment_ids):
+        try:
+            experiment = store.get_experiment(experiment_id)
+            rows.append(experiment.model_dump(mode="json"))
+        except StoreError:
+            # Dry-run IDs and genuinely missing records remain distinguishable
+            # without pretending that a result has been independently verified.
+            rows.append({"experiment_id": experiment_id, "missing": True})
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
 class SubmittedResult(BaseModel):

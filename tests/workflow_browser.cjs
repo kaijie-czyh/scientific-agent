@@ -26,7 +26,7 @@ const assert=require('node:assert/strict');
             const content=JSON.parse(route.request().postDataJSON().results_json);
             if(content.experiments[0].status==='typo') {await route.fulfill({status:422,json:{detail:'第 1 条结果无效：状态无效；本批未保存'}});return;}
             body={updated:['软件测试任务'],unmatched:[],message:'测试夹具：结果已保存，请点击继续复核'};
-        }else if(path==='run') {runCalls++;status.status='running';status.current_stage='writing';body={project_id:pid,message:'仅浏览器夹具，不启动真实任务'};}
+        }else if(path==='resume') {runCalls++;status.status='running';status.current_stage='writing';body={project_id:pid,action:'started',page:'progress',message:'仅浏览器夹具，不启动真实任务'};}
         else throw new Error(`未预期请求：${path}`);
         await route.fulfill({status:200,json:body});
     });

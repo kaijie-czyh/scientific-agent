@@ -18,6 +18,7 @@ const assert=require('node:assert/strict');
         await select.waitFor();
         assert.deepEqual(await select.locator('option').evaluateAll(nodes=>nodes.map(n=>n.value)),['computer_science','ai','security']);
         assert.equal(await page.locator('#domain-custom-input').count(),0);
+        await page.locator('.session-options > summary').click();
         assert.match(await page.locator('#research-scope-notice').innerText(),/暂不支持医学/);
         await select.selectOption('security');
         assert.match(await page.locator('#domain-hint').innerText(),/明确授权/);

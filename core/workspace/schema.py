@@ -38,12 +38,24 @@ class ItemInput(Contract):
     supersedes_id: str | None = None
 
 
+class SourceRef(Contract):
+    kind: Literal["idea", "gap", "method", "experiment_plan", "experiment_result"]
+    source_id: str
+    fingerprint: str
+
+
+class ResearchFocus(Contract):
+    question: str = ""
+    plan: str = ""
+
+
 class WorkItem(ItemInput):
     item_id: str = Field(default_factory=lambda: uuid4().hex)
     status: Literal["active", "superseded"] = "active"
     needs_review: bool = False
     created_at: str = Field(default_factory=now)
-    origin: Literal["user", "accepted_suggestion"] = "user"
+    origin: Literal["user", "accepted_suggestion", "linked_material"] = "user"
+    source_ref: SourceRef | None = None
 
 
 class SuggestedItem(Contract):
@@ -85,6 +97,7 @@ class Workspace(Contract):
     project_id: str
     revision: int = 0
     brief: Brief = Field(default_factory=Brief)
+    focus: ResearchFocus = Field(default_factory=ResearchFocus)
     items: list[WorkItem] = Field(default_factory=list)
     messages: list[Message] = Field(default_factory=list)
     suggestions: list[Suggestion] = Field(default_factory=list)

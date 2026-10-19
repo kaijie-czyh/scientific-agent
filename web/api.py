@@ -105,9 +105,11 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from pydantic import Field, ValidationError  # noqa: E402
 from core.experiment_results import SubmittedResult  # noqa: E402
+from core.project_archive import archive_project_directories  # noqa: E402
 
 from core.config import get_config  # noqa: E402
-from core.research_scope import normalize_public_domain  # noqa: E402
+from core.document_math import MATH_DOCUMENT_GUIDE, split_table_row  # noqa: E402
+from core.research_scope import normalize_public_domain, is_public_domain  # noqa: E402
 from core.knowledge import KnowledgeStore, ExperimentStatus  # noqa: E402
 from core.llm.base import strip_think_tags  # noqa: E402
 from core.llm import LLMRegistry  # noqa: E402
@@ -146,6 +148,11 @@ class RunProjectRequest(BaseModel):
 
 class NoteRequest(BaseModel):
     text: str
+
+
+class BatchDeleteProjectsRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    project_ids: list[str] = Field(min_length=1, max_length=200)
 
 
 class HumanResponseRequest(BaseModel):
@@ -288,6 +295,10 @@ def _recover_project_topic(pid: str) -> str:
     """
     try:
         store = KnowledgeStore(_CONFIG.paths.project_db(pid))
+        saved = store.get_kv("pipeline.context.v1", {}) or {}
+        selected = (saved.get("data", {}) or {}).get("topic_discovery.selected_topic")
+        if selected:
+            return str(selected)
         topic = store.get_kv("research.topic", "")
         if topic:
             return str(topic)
@@ -384,7 +395,10 @@ def _scan_existing_projects() -> None:
             topic_discovery=persisted_discovery,
             domain=domain,
             node_history=saved_history,
-            run_mode="topic_discovery" if saved_run.get("current_stage") == "topic_discovery" else "pipeline" if persisted_discovery.get("selected_topic") else "",
+            run_mode="pipeline" if (saved_run.get("data", {}) or {}).get("topic_discovery.selected_topic") else (
+                "topic_discovery" if saved_run.get("current_stage") == "topic_discovery"
+                else store.get_kv("web.run_mode", "pipeline")),
+            search_prefs=store.get_kv("web.search_prefs") or None,
         )
 
 
@@ -451,6 +465,7 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
         # 人工等待期间将 status 置为 pending_human，前端可明确感知
         _progress_cbs = _make_progress_callback(state)
         state.run_mode = "pipeline"
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.run_mode", "pipeline")
         human_cb = _BRIDGE.make_callback(
             project_id,
             on_pending=lambda: _set_state_status(state, "pending_human"),
@@ -491,6 +506,7 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
     try:
         _set_state_status(state, "running")
         state.run_mode = "topic_discovery"
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.run_mode", "topic_discovery")
         pipeline = Pipeline(config=_CONFIG)
         human_cb = _BRIDGE.make_callback(
             project_id,
@@ -549,7 +565,13 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
                 args=(project_id, selected.strip(), resume2, False),
                 daemon=True,
             )
-            pipeline_thread.start()
+            with _LOCK:
+                # Track the new worker, not the topic-discovery worker that is
+                # about to exit; otherwise resume may mistake a live wait for
+                # an orphan and clear its human confirmation bridge.
+                state.thread = pipeline_thread
+                state.status = "running"
+                pipeline_thread.start()
     except Exception as e:  # noqa: BLE001
         state.status = "failed"
         state.error = f"{type(e).__name__}: {e}"
@@ -630,6 +652,76 @@ def _public_domain(domain: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _writing_artifact_count(store) -> int:
+    from core.knowledge.schema import ArtifactType
+    latest = {}
+    for artifact in store.list_artifacts():
+        if artifact.artifact_type in (ArtifactType.PAPER_DRAFT, ArtifactType.REVIEW_NOTE):
+            old = latest.get(artifact.artifact_group)
+            if old is None or artifact.version > old.version:
+                latest[artifact.artifact_group] = artifact
+    return sum(bool(a.content or a.content_path) for a in latest.values())
+
+
+def _engine_continuation(state: ProjectState, store=None, stage_statuses=None) -> dict:
+    """只描述当前可执行动作；浏览状态不自动启动任务或确认科研结论。"""
+    store = store or KnowledgeStore(_CONFIG.paths.project_db(state.project_id))
+    saved = store.get_kv("pipeline.context.v1", {}) or {}
+    data = saved.get("data", {}) or {}
+    history = saved.get("history", []) or state.node_history or []
+    last = history[-1] if history else {}
+    td = {**(store.get_kv("web.topic_discovery", {}) or {}), **state.topic_discovery}
+    selected = data.get("topic_discovery.selected_topic") or td.get("selected_topic")
+    mode = "pipeline" if selected else (
+        "topic_discovery" if saved.get("current_stage") == "topic_discovery"
+        else state.run_mode or store.get_kv("web.run_mode", "pipeline"))
+    stage = saved.get("current_stage") or ("topic_discovery" if mode == "topic_discovery" else "research")
+    info = {"action": "resume", "label": "继续当前任务", "page": "progress", "run_mode": mode,
+            "stage": stage, "node_id": saved.get("current_node_id") or last.get("node_id"),
+            "hint": "从已保存的阶段继续；已完成的材料保留，未完成或失败的请求可能需要重试。"}
+    if not is_public_domain(state.domain):
+        return {**info, "action": "view_only", "label": "查看历史材料", "page": "dashboard", "hint": "该历史领域暂不开放新运行，已有材料与记录保留。"}
+    live = state.thread is not None and state.thread.is_alive()
+    if live:
+        pending = _BRIDGE.get_pending(state.project_id)
+        return {**info, "action": "confirm" if pending else "running", "label": "前往确认" if pending else "查看运行进度",
+                "page": "human" if pending else "progress", "hint": "等待你审核，浏览器可以关闭。" if pending else "任务正在运行，不会重复启动。"}
+    done = stage_statuses and all(stage_statuses.get(s.value) == "done" for s in LifecycleStage.ordered())
+    if done or (state.status == "completed" and mode != "topic_discovery"):
+        hint = "后台流程已结束，可核对与导出已有材料；不代表创新已经成立。"
+        if store.get_kv("writing.results_need_review"):
+            hint = "终稿保存后结果有更新，已有稿件未自动改写。请核对新结果与稿件差异后人工修订，不能将旧稿视为最新结论。"
+        return {**info, "action": "complete", "label": "查看已有成果", "page": "writing", "hint": hint}
+    outcome = data.get("experiment.outcome", {}) or {}
+    if state.status == "experiment_pending" or outcome.get("recommendation") == "wait_for_user_results":
+        experiments = store.list_experiments()
+        expected = set(data.get("experiment.experiment_ids", []) or [])
+        if expected:
+            experiments = [e for e in experiments if e.experiment_id in expected]
+        if not experiments or expected - {e.experiment_id for e in experiments} or any(e.status in (ExperimentStatus.PLANNED, ExperimentStatus.RUNNING) for e in experiments):
+            return {**info, "action": "results", "label": "前往回填结果", "page": "experiments", "hint": "任务已保存，等待外部执行与实际结果。可以离开系统，回填后再继续。"}
+        return {**info, "run_mode": "pipeline", "label": "复核结果并继续", "hint": "已有用户回填结果，下一步复核证据；不会重新生成实验任务。"}
+    if mode == "topic_discovery":
+        info.update(label="继续选题探索", hint="恢复选题探索及主题确认，不跳过选题直接启动主科研流程。")
+    if last.get("status") == "pending_human":
+        info.update(label="恢复待确认事项", hint="重新打开上次的确认节点，保留已有材料，不会自动替你确认。",restore_gate=True)
+    return info
+
+
+def _workspace_workflow(state: ProjectState, store=None, stage_statuses=None, *, include_materials=False) -> dict:
+    from core.workspace.service import WorkspaceService
+    execution = _engine_continuation(state,store,stage_statuses)
+    service = WorkspaceService(state.project_id,_CONFIG.paths.project_db(state.project_id))
+    workflow = service.workflow(execution=execution)
+    if not include_materials:
+        workflow["materials"] = [{key:value for key,value in source.items() if key!="content"} for source in workflow["materials"]]
+    return workflow
+
+
+def _continuation(state: ProjectState, store=None, stage_statuses=None) -> dict:
+    return _workspace_workflow(state,store,stage_statuses)["continuation"]
+
+
 @app.post("/api/projects")
 def create_project(req: CreateProjectRequest) -> dict:
     """创建新项目，返回 project_id。"""
@@ -679,22 +771,38 @@ def list_projects() -> dict:
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str) -> dict:
-    """删除项目：清理内存中的 ProjectState，并删除磁盘上的项目目录（含 knowledge.db）。"""
-    # 内存清理
+    result = delete_projects_batch(BatchDeleteProjectsRequest(project_ids=[project_id]))
+    return {"project_id": project_id, "deleted": True, "recoverable": True, "archive_id": result["archive_id"]}
+
+
+@app.post("/api/projects/batch-delete")
+def delete_projects_batch(req: BatchDeleteProjectsRequest) -> dict:
+    """Preflight the whole selection, archive files, then remove active entries."""
+    ids = req.project_ids
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=422, detail="项目编号重复，本批未删除")
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", pid) for pid in ids):
+        raise HTTPException(status_code=422, detail="项目编号不合法，本批未删除")
     with _LOCK:
-        state = _PROJECTS.pop(project_id, None)
-        if state is not None and state.thread and state.thread.is_alive():
-            # 线程仍在运行：不允许删除，避免留下孤立线程
-            _PROJECTS[project_id] = state
-            raise HTTPException(
-                status_code=409,
-                detail="项目正在运行中，请先中止 Pipeline 再删除",
-            )
-    # 磁盘清理：项目目录（knowledge.db / vectors / snapshots / artifacts / uploads / experiments）
-    project_dir = _CONFIG.paths.project_dir(project_id)
-    if project_dir.exists() and project_dir.resolve().is_relative_to(_CONFIG.paths.projects.resolve()):
-        shutil.rmtree(project_dir, ignore_errors=True)
-    return {"project_id": project_id, "deleted": True}
+        for pid in ids:
+            state = _PROJECTS.get(pid)
+            if state is None:
+                raise HTTPException(status_code=404, detail=f"项目不存在：{pid}；本批未删除，请刷新列表")
+            if (state.status in ("running", "pending_human") or state.thread and state.thread.is_alive()
+                    or _METHOD_REGEN_JOBS.get(pid, {}).get("status") == "running"):
+                raise HTTPException(status_code=409, detail=f"项目 {pid} 正在运行或等待确认；本批未删除")
+        try:
+            archive_id = archive_project_directories(_CONFIG.paths, ids)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (RuntimeError, OSError) as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        for pid in ids:
+            _PROJECTS.pop(pid, None)
+            _METHOD_REGEN_JOBS.pop(pid, None)
+            _BRIDGE.clear(pid)
+    return {"deleted": ids, "recoverable": True, "archive_id": archive_id,
+            "message": f"已将 {len(ids)} 个项目移入本机可恢复归档，不会直接抹除研究文件。"}
 
 
 @app.get("/api/projects/{project_id}/status")
@@ -713,7 +821,7 @@ def get_status(project_id: str) -> dict:
 
     # 产出物计数
     counts = {"papers": 0, "ideas": 0, "claims": 0, "experiments": 0, "evidence": 0,
-              "entities": 0, "properties": 0, "methods": 0, "gaps": 0, "report_gaps": 0}
+              "entities": 0, "properties": 0, "methods": 0, "gaps": 0, "report_gaps": 0, "writing_artifacts": 0}
     notes_count = None
     try:
         store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
@@ -732,6 +840,7 @@ def get_status(project_id: str) -> dict:
         # 导航「研究现状」统计报告内的问题，而非全部结构化研究缺口。
         report = store.get_kv("cross_validation_report") or {}
         counts["report_gaps"] = len(report.get("gaps") or [])
+        counts["writing_artifacts"] = _writing_artifact_count(store)
         notes_count = len(_merged_project_notes(store, state))
     except Exception:  # noqa: BLE001
         pass
@@ -746,12 +855,16 @@ def get_status(project_id: str) -> dict:
     except Exception:  # noqa: BLE001
         node_progress = None
 
+    with _LOCK:
+        status_value = state.status
+        pending = _BRIDGE.get_pending(project_id)
+    workflow = _workspace_workflow(state,stage_statuses=stage_statuses)
     return {
         "project_id": project_id,
         "topic": state.topic,
         "domain": state.domain,
         "created_at": state.created_at,
-        "status": state.status,
+        "status": status_value,
         "run_mode": state.run_mode,
         "summary": state.summary,
         "recommendation": state.recommendation,
@@ -768,17 +881,48 @@ def get_status(project_id: str) -> dict:
         "search_prefs": state.search_prefs,
         "topic_discovery": state.topic_discovery,
         "node_progress": node_progress,
+        "continuation": workflow["continuation"],
+        "workflow": workflow,
     }
+
+
+@app.post("/api/projects/{project_id}/resume")
+def resume_project_task(project_id: str) -> dict:
+    """统一继续入口：选题/主流程自动分流，运行中与等待结果时不重复启动。"""
+    state = _require_project(project_id)
+    info = get_status(project_id)["continuation"]
+    if info["action"] != "resume":
+        return {"project_id": project_id, **info, "message": info["hint"]}
+    with _LOCK:
+        if state.thread is not None and state.thread.is_alive():
+            return {"project_id": project_id, **info, "action": "running", "page": "progress", "message": "任务已在运行，不会重复启动。"}
+        if state.status in ("running", "pending_human"):
+            state.status = "stopped"
+            _BRIDGE.clear(project_id)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    saved = store.get_kv("pipeline.context.v1", {}) or {}
+    selected = (saved.get("data", {}) or {}).get("topic_discovery.selected_topic")
+    if selected:
+        state.topic = selected
+    if info["run_mode"] == "topic_discovery":
+        td = store.get_kv("web.topic_discovery", {}) or state.topic_discovery
+        interest = td.get("interest") or (saved.get("data", {}) or {}).get("topic_discovery.interest") or state.topic
+        result = run_topic_discovery(project_id, TopicDiscoveryRequest(interest=interest, domain=state.domain))
+    else:
+        result = run_project(project_id)
+    return {**result, **info, "action": "started", "message": "已从保存的进度继续，请在任务进度中查看；需要确认时仍由你决定。"}
 
 
 @app.post("/api/projects/{project_id}/run")
 def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dict:
     """启动/继续 pipeline（异步执行，立即返回）。
 
-    可选 body: {"force_writing": true} —— 实验失败后强制进入论文写作阶段。
+    force_writing 只用于 dry_run 架构检查；真实模式不允许绕过结果审核。
     """
     state = _require_project(project_id)
     _public_domain(state.domain)
+    if req and req.force_writing and not _CONFIG.dry_run:
+        raise HTTPException(status_code=422,detail="真实模式不能跳过结果审核强制生成实证稿件。可先在成果写作整理骨架，或提交真实结果后继续。")
     if state.status == "running":
         raise HTTPException(status_code=409, detail="pipeline 正在运行中")
     if state.status == "pending_human":
@@ -791,7 +935,8 @@ def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dic
             status_code=400,
             detail="项目主题为空（服务重启后恢复的项目不持久化 topic），请重新创建项目或补充主题",
         )
-    resume = state.status not in ("created",)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    resume = state.status != "created" or bool(store.get_kv("pipeline.context.v1"))
     force_writing = (req.force_writing if req else False)
     thread = threading.Thread(
         target=_run_pipeline_thread,
@@ -838,7 +983,8 @@ def run_topic_discovery(project_id: str, req: TopicDiscoveryRequest) -> dict:
             status_code=409,
             detail="当前等待人工响应，请先提交 human-response 或中止",
         )
-    resume = state.status not in ("created",)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    resume = state.status != "created" or bool(store.get_kv("pipeline.context.v1"))
     # 不允许通过该接口把历史非计算机项目静默改为另一领域。
     _public_domain(state.domain)
     domain = _public_domain((req.domain or "").strip() or state.domain)
@@ -2108,7 +2254,7 @@ def _generate_method_doc(project_id: str, hint: str) -> str:
             task_type="design_method_formalize",
             system=(
                 "你是科研方法形式化助手。基于给定素材整合完整方法文档，"
-                "输出 Markdown 格式，不得输出空内容或省略章节。"
+                "输出 Markdown 格式，不得输出空内容或省略章节。" + MATH_DOCUMENT_GUIDE
             ),
             prompt=prompt,
             # 推理模型经网关时 reasoning 也计入 max_tokens，2048 默认值
@@ -2226,6 +2372,9 @@ def backfill_experiment_results(project_id: str, req: ExperimentBackfillRequest)
             raise HTTPException(status_code=409, detail="科研任务已启动，本次结果尚未保存，请等待任务结束后重试")
         store.save_experiments_batch(pending)
     state.summary = f"已保存 {len(updated)} 条用户实验结果。点击继续运行复核结果，不会重新生成实验任务。"
+    if state.status == "completed":
+        store.save_kv("writing.results_need_review", True)
+        state.summary = "结果已更新，原稿件保留但需要核对修订；系统不会把旧稿自动当作新结果的结论。"
 
     return {
         "updated": updated,
@@ -2287,6 +2436,7 @@ def submit_human_response(project_id: str, req: HumanResponseRequest) -> dict:
     if req.search_prefs:
         resp.context = {"search_prefs": req.search_prefs}
         state.search_prefs = dict(req.search_prefs)
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.search_prefs", state.search_prefs)
     ok = _BRIDGE.submit(project_id, resp)
     if not ok:
         # 没有等待中的人工请求：可能已提交、已超时、被清除，或多实例分裂
@@ -2356,16 +2506,7 @@ def get_dashboard(project_id: str) -> dict:
     # 论文写作摘要
     writing_summary = {"artifact_count": 0}
     try:
-        from core.artifacts import ArtifactManager as _AM, ArtifactContentStore as _ACS
-        from core.knowledge import ArtifactType
-        am = _AM(store, _ACS(_CONFIG.paths.project_artifacts(project_id)))
-        art_count = 0
-        for wt in (ArtifactType.PAPER_DRAFT, ArtifactType.REVIEW_NOTE):
-            try:
-                art_count += len(am.list_artifacts(artifact_type=wt))
-            except Exception:  # noqa: BLE001
-                pass
-        writing_summary["artifact_count"] = art_count
+        writing_summary["artifact_count"] = _writing_artifact_count(store)
     except Exception:  # noqa: BLE001
         pass
 
@@ -2380,6 +2521,8 @@ def get_dashboard(project_id: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    workflow = _workspace_workflow(state,store,stage_statuses)
+    counts["writing_artifacts"] = writing_summary["artifact_count"]
     return {
         "project_id": project_id,
         "topic": state.topic,
@@ -2399,6 +2542,9 @@ def get_dashboard(project_id: str) -> dict:
         },
         "writing_summary": writing_summary,
         "pending_human": _BRIDGE.get_pending(project_id),
+        "continuation": workflow["continuation"],
+        "workflow": workflow,
+        "run_mode": state.run_mode,
     }
 
 
@@ -2474,7 +2620,7 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
             am = _artifact_manager(project_id)
             arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
             if arts:
-                md_content = am.read_content(arts[0]) or ""
+                md_content = am.read_content(arts[-1]) or ""
                 if not md_content.strip():
                     md_content = (
                         "# 方法文档为空\n\n"
@@ -2494,7 +2640,7 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
             am = _artifact_manager(project_id)
             arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
             if arts:
-                md_content = am.read_content(arts[0]) or str(arts[0].content or "")
+                md_content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             else:
                 md_content = "# 暂无 论文稿\n\n> 尚未生成论文稿，请先运行 writing 阶段。"
         except Exception:
@@ -2972,7 +3118,7 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
         am = _artifact_manager(project_id)
         arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
         if arts:
-            content = am.read_content(arts[0]) or str(arts[0].content or "")
+            content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             parts.append("\n\n---\n\n# 第四部分：方法设计\n\n")
             parts.append(content)
     except Exception:
@@ -2991,7 +3137,7 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
         am = _artifact_manager(project_id)
         arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
         if arts:
-            content = am.read_content(arts[0]) or str(arts[0].content or "")
+            content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             parts.append("\n\n---\n\n# 第六部分：论文稿\n\n")
             parts.append(content)
     except Exception:
@@ -3011,6 +3157,13 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
     if discovery_content:
         parts.append("\n\n---\n\n# 第七部分：关系发现\n\n")
         parts.append(discovery_content)
+
+    from core.workspace.service import WorkspaceService
+    workspace = WorkspaceService(project_id,_CONFIG.paths.project_db(project_id))
+    if workspace.load().items:
+        parts.append("\n\n---\n\n# 第八部分：当前研究主线与用户记录\n\n")
+        parts.append("以下含计划、骨架及可能的演示假设；以各记录标记为准，不将预期数据算作真实实验结果。\n\n")
+        parts.append(workspace.export_markdown())
 
     return "".join(parts) if parts else "# 全流程报告\n\n（暂无产出）"
 
@@ -3046,35 +3199,8 @@ def _md_is_table_separator(line: str) -> bool:
 
 
 def _md_split_table_row(line: str) -> list[str]:
-    """把 Markdown 表格行 `| a | b |` 拆为单元格列表（去首尾空 + 去行内标记）。
-
-    正确处理转义管道符 ``\\|``：拆分时跳过 ``\\|``，拆分后再还原为字面 ``|``，
-    避免标题 / 期刊里的 ``|``（如「中文标题 | 英文标题」）被误当分隔符导致列错位。
-    """
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    cells: list[str] = []
-    cur: list[str] = []
-    j = 0
-    n = len(stripped)
-    while j < n:
-        ch = stripped[j]
-        if ch == "\\" and j + 1 < n and stripped[j + 1] == "|":
-            cur.append("|")
-            j += 2
-            continue
-        if ch == "|":
-            cells.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-        j += 1
-    cells.append("".join(cur))
-    return [_md_strip_inline(c) for c in cells]
-
+    """Split Markdown columns without breaking TeX cardinality/norm expressions."""
+    return [_md_strip_inline(cell) for cell in split_table_row(line)]
 
 def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
     """将 Markdown 转为 DOCX 并返回下载响应。
@@ -3556,17 +3682,18 @@ def _artifact_manager(project_id: str):
 
 def _require_project(project_id: str) -> ProjectState:
     with _LOCK:
+        if project_id not in _PROJECTS and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", project_id):
+            if _CONFIG.paths.project_db(project_id).is_file():
+                _scan_existing_projects()
         state = _PROJECTS.get(project_id)
     if state is None:
         raise HTTPException(
             status_code=404,
             detail=(
                 f"项目不存在: {project_id}"
-                "（若刚重启服务，内存项目列表已丢失，请重新创建项目；"
-                "若访问了错误端口，请确认 8001 单实例）"
+                "。请核对项目编号及当前服务的数据目录；不要通过新建项目覆盖原项目。"
             ),
         )
-        raise HTTPException(status_code=404, detail=f"项目不存在: {project_id}")
     return state
 
 
@@ -3575,7 +3702,7 @@ def _require_project(project_id: str) -> ProjectState:
 
 from web.workspace_api import build_workspace_router  # noqa: E402
 
-app.include_router(build_workspace_router(_CONFIG, _require_project))
+app.include_router(build_workspace_router(_CONFIG, _require_project,workflow_provider=lambda state:_workspace_workflow(state,include_materials=True)))
 
 
 @app.get("/workspace")

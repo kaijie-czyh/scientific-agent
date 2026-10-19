@@ -1,8 +1,8 @@
 /* 项目管理的只读建议：研究状态与后台状态分开，不自动确认科研结论。 */
 ((root) => {
     "use strict";
-    function summarize(workspace={}, papers=[], status={}, focus={}) {
-        const flow=root.SRA_RESEARCH_FLOW.analyze(workspace,papers,focus);
+    function summarize(workspace={}, papers=[], status={}, focus={}, workflow=null) {
+        const flow=workflow?.flow || root.SRA_RESEARCH_FLOW.analyze(workspace,papers,focus);
         const brief=workspace.brief || {}, active=(workspace.items || []).filter(item=>item.status==="active");
         const review=active.filter(item=>item.needs_review);
         const labels={running:"后台运行中",in_progress:"后台运行中",pending_human:"等待人工确认",completed:"后台任务已结束",failed:"后台任务失败",blocked:"后台任务受阻",stopped:"后台任务已停止",aborted:"后台任务已取消",created:"尚未启动后台任务",experiment_pending:"等待实验结果回填",experiment_failed:"后台实验阶段需检查"};
