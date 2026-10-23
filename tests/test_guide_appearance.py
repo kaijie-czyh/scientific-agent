@@ -25,3 +25,7 @@ def test_avatar_is_only_added_to_assistant_messages():
     avatar = js.split('function messageAvatar(', 1)[1].split('async function request(', 1)[0]
     assert 'fetch(' not in avatar
     assert 'scrollTop' not in avatar
+    central=(ROOT / "web/static/conversation-home.js").read_text(encoding="utf-8")
+    assert 'if(m.role==="assistant")' in central
+    assert '/static/assets/research-guide.png' in central
+    assert 'if (window.SRA_CONVERSATIONS) return;' in js

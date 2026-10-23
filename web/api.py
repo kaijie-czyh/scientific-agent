@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
 
 # 确保项目根在 sys.path（python -m web.api 已保证，但直接运行脚本时需补充）
@@ -32,6 +33,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 from runtime.cli import _load_env  # noqa: E402
 
 _load_env()
+
+# 本地回环永远直连：把回环地址并入进程级 NO_PROXY（保留既有条目，
+# 不清空、不全局禁用代理）。避免本机模型网关 / 本服务自调用被代理劫持。
+from core.tools.http import ensure_loopback_direct  # noqa: E402
+
+ensure_loopback_direct()
 
 
 def _set_global_seed() -> None:
@@ -106,8 +113,12 @@ from pydantic import BaseModel  # noqa: E402
 from pydantic import Field, ValidationError  # noqa: E402
 from core.experiment_results import SubmittedResult  # noqa: E402
 from core.project_archive import archive_project_directories  # noqa: E402
+from core.project_catalog import project_metadata, project_rows, project_page, recent_conversations, has_active_chat  # noqa: E402
+from typing import Annotated
+from fastapi import Query
 
 from core.config import get_config  # noqa: E402
+from core.product_boundary import inspect_boundary, public_boundary, historical_stage, NOTICE  # noqa: E402
 from core.document_math import MATH_DOCUMENT_GUIDE, split_table_row  # noqa: E402
 from core.research_scope import normalize_public_domain, is_public_domain  # noqa: E402
 from core.knowledge import KnowledgeStore, ExperimentStatus  # noqa: E402
@@ -253,6 +264,7 @@ class ProjectState:
     # 研究领域（领域自适应）：决定各阶段 prompt 中「抽取什么对象 /
     # 关注什么指标 / 记录什么方法」的语义，材料只是可选值之一
     domain: str = ""
+    display_name: str = ""  # Presentation only; never replaces the research topic.
     status: str = "created"  # created / running / pending_human / completed / failed / aborted
     summary: str = ""
     last_result: Optional[PipelineResult] = None
@@ -294,7 +306,7 @@ def _recover_project_topic(pid: str) -> str:
     3. 兜底空字符串（前端提示重新确认主题）
     """
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(pid))
+        store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
         saved = store.get_kv("pipeline.context.v1", {}) or {}
         selected = (saved.get("data", {}) or {}).get("topic_discovery.selected_topic")
         if selected:
@@ -329,26 +341,26 @@ def _scan_existing_projects() -> None:
     if not projects_dir.exists():
         return
     for pdir in sorted(projects_dir.iterdir()):
-        if not pdir.is_dir() or pdir.name in _PROJECTS:
+        if not pdir.is_dir() or pdir.is_symlink() or pdir.name in _PROJECTS:
             continue
         if not (pdir / "knowledge.db").exists():
             continue
         pid = pdir.name
-        # created_at 从目录名解析：proj_YYYYMMDD_HHMMSS_xxxx
-        created_at = datetime.utcnow().isoformat()
-        try:
-            _, ts = pid.split("_", 1)
-            created_at = datetime.strptime(ts[:13], "%Y%m%d_%H%M%S").isoformat()
-        except Exception:
-            pass
+        # Read persisted times, never make a historical project "new" on scan.
+        catalog_entry = project_metadata(pdir / "knowledge.db", pid)
+        created_at = catalog_entry["created_at"] or ""
+        if catalog_entry["data_status"] != "available":
+            _PROJECTS[pid] = ProjectState(project_id=pid, topic="", created_at=created_at,
+                status="unavailable", summary="项目数据库不可读取，原目录保留；未自动修复或建立替代库。")
+            continue
         # 从 session 快照推断运行状态
         status, summary = "created", ""
         try:
-            session = ProjectSession.load(pid, _CONFIG.paths)
-            cur = session.current_stage().value
+            boundary=inspect_boundary(_CONFIG.paths,pid)
+            cur = historical_stage(boundary)
             done = [s for s in LifecycleStage.ordered()
-                    if session.status_of(s) in (StageStatus.DONE, StageStatus.BLOCKED)]
-            if all(session.status_of(s) == StageStatus.DONE for s in LifecycleStage.ordered()):
+                    if boundary["stage_statuses"].get(s.value) in ("done","blocked")]
+            if all(boundary["stage_statuses"].get(s.value) == "done" for s in LifecycleStage.ordered()):
                 status = "completed"
                 summary = "服务重启后恢复：全流程已完成"
             elif done or cur != LifecycleStage.RESEARCH.value:
@@ -359,7 +371,7 @@ def _scan_existing_projects() -> None:
         except Exception:
             status, summary = "created", "服务重启后自动恢复"
         try:
-            store = KnowledgeStore(_CONFIG.paths.project_db(pid))
+            store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
             saved_run = store.get_kv("pipeline.context.v1", {}) or {}
             domain = store.get_kv("project.domain", "") or ""
         except Exception:
@@ -376,9 +388,9 @@ def _scan_existing_projects() -> None:
             summary = saved_history[-1].get("summary", "上次节点执行失败，可从失败处恢复")
         if status != "completed" and (saved_run.get("data", {}).get("experiment.outcome") or {}).get("recommendation") == "wait_for_user_results":
             status = "experiment_pending"
-            summary = "实验任务与方法已恢复，等待实际结果；回填后可继续复核，无需重新规划"
+            summary = "历史实验任务与方法已恢复，仅供查看与导出；当前产品不继续实验或写作。"
         try:
-            persisted_discovery = KnowledgeStore(_CONFIG.paths.project_db(pid)).get_kv(
+            persisted_discovery = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True).get_kv(
                 "web.topic_discovery", {}
             ) or {}
         except Exception:
@@ -394,6 +406,7 @@ def _scan_existing_projects() -> None:
             summary=summary,
             topic_discovery=persisted_discovery,
             domain=domain,
+            display_name=store.get_kv("project.display_name", "") or "",
             node_history=saved_history,
             run_mode="pipeline" if (saved_run.get("data", {}) or {}).get("topic_discovery.selected_topic") else (
                 "topic_discovery" if saved_run.get("current_stage") == "topic_discovery"
@@ -402,7 +415,8 @@ def _scan_existing_projects() -> None:
         )
 
 
-_scan_existing_projects()
+if os.environ.get("SRA_WEB_SKIP_PROJECT_SCAN") != "1":
+    _scan_existing_projects()
 
 
 # ===== Pipeline 工作线程 =====
@@ -458,6 +472,9 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
     state = _PROJECTS.get(project_id)
     if state is None:
         return
+    boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"] == "design_generated":
+        return  # Never repair or restart an out-of-scope historical checkpoint.
     try:
         _set_state_status(state, "running")
         pipeline = Pipeline(config=_CONFIG)
@@ -502,6 +519,9 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
     """工作线程函数：执行方向推荐并更新项目状态。"""
     state = _PROJECTS.get(project_id)
     if state is None:
+        return
+    boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"] == "design_generated":
         return
     try:
         _set_state_status(state, "running")
@@ -555,6 +575,9 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
         # 若用户已选定主题，自动把所选主题写入 state.topic，并启动 research pipeline
         selected = (result.extra or {}).get("selected_topic", "") or ""
         if result.status == "completed" and selected.strip():
+            boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+            if boundary["restricted"] or boundary["reason"] == "design_generated":
+                return
             with _LOCK:
                 state.topic = selected.strip()
                 state.run_mode = "pipeline"
@@ -665,7 +688,11 @@ def _writing_artifact_count(store) -> int:
 
 def _engine_continuation(state: ProjectState, store=None, stage_statuses=None) -> dict:
     """只描述当前可执行动作；浏览状态不自动启动任务或确认科研结论。"""
-    store = store or KnowledgeStore(_CONFIG.paths.project_db(state.project_id))
+    boundary=inspect_boundary(_CONFIG.paths,state.project_id,pending=_BRIDGE.get_pending(state.project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"]:
+        return {"action":"view_only","label":"查看与导出历史材料","page":"dashboard","hint":boundary["message"],
+                "stage":boundary.get("execution_stage",""),"run_mode":state.run_mode or "pipeline","product_boundary":public_boundary(boundary)}
+    store = store or KnowledgeStore(_CONFIG.paths.project_db(state.project_id),read_only=True)
     saved = store.get_kv("pipeline.context.v1", {}) or {}
     data = saved.get("data", {}) or {}
     history = saved.get("history", []) or state.node_history or []
@@ -687,20 +714,17 @@ def _engine_continuation(state: ProjectState, store=None, stage_statuses=None) -
         return {**info, "action": "confirm" if pending else "running", "label": "前往确认" if pending else "查看运行进度",
                 "page": "human" if pending else "progress", "hint": "等待你审核，浏览器可以关闭。" if pending else "任务正在运行，不会重复启动。"}
     done = stage_statuses and all(stage_statuses.get(s.value) == "done" for s in LifecycleStage.ordered())
+    if boundary["reason"]=="design_generated":
+        return {**info,"action":"materials","page":"experiments","label":"确认并审阅已有方案","hint":"方法文档已保留；请确认研究问题及关联方案后审阅或导出，不启动后续阶段。"}
     if done or (state.status == "completed" and mode != "topic_discovery"):
         hint = "后台流程已结束，可核对与导出已有材料；不代表创新已经成立。"
         if store.get_kv("writing.results_need_review"):
             hint = "终稿保存后结果有更新，已有稿件未自动改写。请核对新结果与稿件差异后人工修订，不能将旧稿视为最新结论。"
-        return {**info, "action": "complete", "label": "查看已有成果", "page": "writing", "hint": hint}
+        return {**info, "action": "materials", "label": "核对已有问题与方案", "page": "experiments", "hint": "后台材料任务已结束，请核对已有研究问题与方案；本轮止于方案，不继续写作。"}
     outcome = data.get("experiment.outcome", {}) or {}
     if state.status == "experiment_pending" or outcome.get("recommendation") == "wait_for_user_results":
-        experiments = store.list_experiments()
-        expected = set(data.get("experiment.experiment_ids", []) or [])
-        if expected:
-            experiments = [e for e in experiments if e.experiment_id in expected]
-        if not experiments or expected - {e.experiment_id for e in experiments} or any(e.status in (ExperimentStatus.PLANNED, ExperimentStatus.RUNNING) for e in experiments):
-            return {**info, "action": "results", "label": "前往回填结果", "page": "experiments", "hint": "任务已保存，等待外部执行与实际结果。可以离开系统，回填后再继续。"}
-        return {**info, "run_mode": "pipeline", "label": "复核结果并继续", "hint": "已有用户回填结果，下一步复核证据；不会重新生成实验任务。"}
+        return {**info, "action": "view_only", "label": "查看历史实验材料", "page": "experiments", "hint": NOTICE,
+                "product_boundary": {**public_boundary(boundary), "restricted": True, "reason": "legacy_stage_restricted", "execution_stage": "experiment"}}
     if mode == "topic_discovery":
         info.update(label="继续选题探索", hint="恢复选题探索及主题确认，不跳过选题直接启动主科研流程。")
     if last.get("status") == "pending_human":
@@ -711,7 +735,7 @@ def _engine_continuation(state: ProjectState, store=None, stage_statuses=None) -
 def _workspace_workflow(state: ProjectState, store=None, stage_statuses=None, *, include_materials=False) -> dict:
     from core.workspace.service import WorkspaceService
     execution = _engine_continuation(state,store,stage_statuses)
-    service = WorkspaceService(state.project_id,_CONFIG.paths.project_db(state.project_id))
+    service = WorkspaceService(state.project_id,_CONFIG.paths.project_db(state.project_id),initialize_store=False)
     workflow = service.workflow(execution=execution)
     if not include_materials:
         workflow["materials"] = [{key:value for key,value in source.items() if key!="content"} for source in workflow["materials"]]
@@ -741,6 +765,7 @@ def create_project(req: CreateProjectRequest) -> dict:
     store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
     store.save_kv("research.topic", topic)
     store.save_kv("project.domain", state.domain)
+    store.save_kv("project.created_at", state.created_at)
     return {
         "project_id": project_id,
         "topic": topic,
@@ -750,23 +775,56 @@ def create_project(req: CreateProjectRequest) -> dict:
 
 
 @app.get("/api/projects")
-def list_projects() -> dict:
-    """列出所有项目（供前端刷新后恢复）。"""
+def list_projects(
+    limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    q: Annotated[str, Query(max_length=200)] = "",
+    include_project_id: str | None = None,
+) -> dict:
+    """Bounded catalog for new clients; no-query legacy response is preserved."""
     with _LOCK:
-        items = [
-            {
-                "project_id": s.project_id,
-                "topic": s.topic,
-                "created_at": s.created_at,
-                "status": s.status,
-                "summary": s.summary,
-                "domain": s.domain,
-            }
-            for s in _PROJECTS.values()
-        ]
-    # 按创建时间降序
-    items.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"projects": items}
+        _scan_existing_projects()
+        states = list(_PROJECTS.values())
+    page = project_page(project_rows(_CONFIG.paths, states), limit=limit, offset=offset,
+                        q=q, include_project_id=include_project_id)
+    # New paged clients only: derive shared progress for the visible project
+    # page, not every project's conversations or full history on each sidebar read.
+    if limit is not None:
+        from core.workspace.read_model import progress
+        from core.workspace.service import WorkspaceService
+        for row in [*page["projects"], *([page["current_project"]] if page["current_project"] else [])]:
+            if row.get("data_status") != "available":
+                continue
+            try:
+                row["research_progress"] = progress(WorkspaceService(row["project_id"], _CONFIG.paths.project_db(row["project_id"]), initialize_store=False).workflow())
+            except Exception:  # Read failure is not permission to initialize/repair a historical DB.
+                row["research_progress"] = {"label": "研究材料暂不可读取，请核对", "planReady": False}
+    return page
+
+
+@app.get("/api/conversations/recent")
+def list_recent_conversations(
+    limit: Annotated[int, Query(ge=1, le=50)] = 8,
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    include_project_id: str | None = None,
+    include_conversation_id: str | None = None,
+    q: Annotated[str, Query(max_length=200)] = "",
+) -> dict:
+    with _LOCK:
+        _scan_existing_projects()
+        states = list(_PROJECTS.values())
+    projects = project_rows(_CONFIG.paths, states)
+    result = recent_conversations(_CONFIG.paths, projects, limit=limit, offset=offset,q=q)
+    result["current_conversation"] = None
+    selected = next((p for p in projects if p["project_id"] == include_project_id and p["data_status"] == "available"), None)
+    if selected and include_conversation_id:
+        from core.workspace.conversations import ConversationService
+        try:
+            c = ConversationService(include_project_id, _CONFIG.paths.project_db(include_project_id)).get(include_conversation_id)
+            result["current_conversation"] = {**c, "project_name": selected["display_name"], "project_topic": selected["topic"]}
+        except ValueError:
+            pass  # Bad/deleted selection never invents a replacement conversation.
+    return result
 
 
 @app.delete("/api/projects/{project_id}")
@@ -791,6 +849,11 @@ def delete_projects_batch(req: BatchDeleteProjectsRequest) -> dict:
             if (state.status in ("running", "pending_human") or state.thread and state.thread.is_alive()
                     or _METHOD_REGEN_JOBS.get(pid, {}).get("status") == "running"):
                 raise HTTPException(status_code=409, detail=f"项目 {pid} 正在运行或等待确认；本批未删除")
+            try:
+                if has_active_chat(_CONFIG.paths.project_db(pid), pid):
+                    raise HTTPException(409, f"项目 {pid} 对话仍在生成；本批未归档，请完成后再试")
+            except ValueError as exc:
+                raise HTTPException(409, f"项目 {pid} 的对话运行状态暂不可核对；本批未归档") from exc
         try:
             archive_id = archive_project_directories(_CONFIG.paths, ids)
         except ValueError as error:
@@ -811,20 +874,16 @@ def get_status(project_id: str) -> dict:
     # 当前阶段：从 session 读取（若已启动）
     current_stage = ""
     stage_statuses: dict[str, str] = {}
-    try:
-        session = ProjectSession.load(project_id, _CONFIG.paths)
-        current_stage = session.current_stage().value
-        for stage in LifecycleStage.ordered():
-            stage_statuses[stage.value] = session.status_of(stage).value
-    except Exception:  # noqa: BLE001
-        pass
+    boundary = inspect_boundary(_CONFIG.paths,project_id)
+    current_stage = historical_stage(boundary)
+    stage_statuses = {s.value:boundary["stage_statuses"].get(s.value,"not_started") for s in LifecycleStage.ordered()}
 
     # 产出物计数
     counts = {"papers": 0, "ideas": 0, "claims": 0, "experiments": 0, "evidence": 0,
               "entities": 0, "properties": 0, "methods": 0, "gaps": 0, "report_gaps": 0, "writing_artifacts": 0}
     notes_count = None
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         counts["papers"] = len(store.list_papers())
         counts["ideas"] = len(store.list_ideas())
         counts["claims"] = len(store.list_claims())
@@ -850,7 +909,7 @@ def get_status(project_id: str) -> dict:
     # 节点级进度（如 paper_fetch 的检索进度条），读不到则不返回该字段
     node_progress = None
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         node_progress = store.get_kv("web.paper_fetch_progress")
     except Exception:  # noqa: BLE001
         node_progress = None
@@ -859,6 +918,12 @@ def get_status(project_id: str) -> dict:
         status_value = state.status
         pending = _BRIDGE.get_pending(project_id)
     workflow = _workspace_workflow(state,stage_statuses=stage_statuses)
+    from core.workspace.read_model import material_counts
+    from core.workspace.conversations import ConversationService
+    try:
+        saved_material_counts = material_counts(ConversationService(project_id, _CONFIG.paths.project_db(project_id)))
+    except Exception:
+        saved_material_counts = {}
     return {
         "project_id": project_id,
         "topic": state.topic,
@@ -881,8 +946,11 @@ def get_status(project_id: str) -> dict:
         "search_prefs": state.search_prefs,
         "topic_discovery": state.topic_discovery,
         "node_progress": node_progress,
+        "product_stage":workflow["product_stage"],
+        "product_boundary":workflow["product_boundary"],
         "continuation": workflow["continuation"],
         "workflow": workflow,
+        "material_counts": saved_material_counts,
     }
 
 
@@ -890,7 +958,8 @@ def get_status(project_id: str) -> dict:
 def resume_project_task(project_id: str) -> dict:
     """统一继续入口：选题/主流程自动分流，运行中与等待结果时不重复启动。"""
     state = _require_project(project_id)
-    info = get_status(project_id)["continuation"]
+    status_view = get_status(project_id)
+    info = {**status_view["continuation"],"product_stage":status_view["product_stage"],"product_boundary":status_view["product_boundary"]}
     if info["action"] != "resume":
         return {"project_id": project_id, **info, "message": info["hint"]}
     with _LOCK:
@@ -910,19 +979,26 @@ def resume_project_task(project_id: str) -> dict:
         result = run_topic_discovery(project_id, TopicDiscoveryRequest(interest=interest, domain=state.domain))
     else:
         result = run_project(project_id)
-    return {**result, **info, "action": "started", "message": "已从保存的进度继续，请在任务进度中查看；需要确认时仍由你决定。"}
+    if result.get("started") is False:
+        return result
+    return {**result, **info, "action": "started", "message": "已从保存的进度继续，最多推进到研究方案；需要确认时仍由你决定。"}
 
 
 @app.post("/api/projects/{project_id}/run")
 def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dict:
     """启动/继续 pipeline（异步执行，立即返回）。
 
-    force_writing 只用于 dry_run 架构检查；真实模式不允许绕过结果审核。
+    网页不接受 force_writing；演示与真实模式均止于研究方案。
     """
     state = _require_project(project_id)
+    if req and req.force_writing:
+        raise HTTPException(status_code=422,detail=NOTICE)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    workflow=_workspace_workflow(state)
+    info=workflow["continuation"]
+    if boundary["restricted"] or boundary["reason"]=="design_generated" or info["action"] in ("plan_ready","review_record"):
+        return {"project_id":project_id,**info,"message":info["hint"],"resumed":False,"force_writing":False,"started":False,"product_stage":workflow["product_stage"],"product_boundary":workflow["product_boundary"]}
     _public_domain(state.domain)
-    if req and req.force_writing and not _CONFIG.dry_run:
-        raise HTTPException(status_code=422,detail="真实模式不能跳过结果审核强制生成实证稿件。可先在成果写作整理骨架，或提交真实结果后继续。")
     if state.status == "running":
         raise HTTPException(status_code=409, detail="pipeline 正在运行中")
     if state.status == "pending_human":
@@ -959,7 +1035,7 @@ def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dic
     msg = "pipeline 已启动"
     if force_writing:
         msg = "pipeline 已启动（强制写作模式：绕过实验成败判断）"
-    return {"project_id": project_id, "message": msg, "resumed": resume, "force_writing": force_writing}
+    return {"project_id": project_id, "message": msg, "resumed": resume, "force_writing": force_writing,"product_stage":workflow["product_stage"],"product_boundary":workflow["product_boundary"]}
 
 
 
@@ -973,6 +1049,10 @@ def run_topic_discovery(project_id: str, req: TopicDiscoveryRequest) -> dict:
     用户选择通过 /human-response 接口提交。
     """
     state = _require_project(project_id)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"]=="design_generated":
+        info=_continuation(state)
+        return {"project_id":project_id,**info,"message":info["hint"],"started":False,"product_boundary":public_boundary(boundary)}
     interest = (req.interest or "").strip()
     if not interest:
         raise HTTPException(status_code=400, detail="interest 不能为空")
@@ -1026,7 +1106,7 @@ def get_recommendations(project_id: str) -> dict:
 def list_papers(project_id: str) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         papers = store.list_papers()
     except Exception as e:  # noqa: BLE001
         return {"papers": [], "error": f"读取失败: {e}"}
@@ -1080,6 +1160,8 @@ def list_papers(project_id: str) -> dict:
             "pdf_path": p.pdf_path,
             "created_at": p.created_at.isoformat() if p.created_at else None,
             "source_stage": p.source_stage,
+            "reading_scope": meta.get("reading_scope", ""),
+            "parse_error": meta.get("parse_error"),
             # 检索证据链字段（审计溯源：来源 / doc_id / 证据分 / 命中子问题）
             "source": meta.get("source", ""),
             "source_subquery": meta.get("source_subquery", ""),
@@ -1118,7 +1200,7 @@ def list_materials(project_id: str) -> dict:
 
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         materials = store.list_materials(limit=500)
         stats = store.material_stats()
         # 聚合：研究对象 → 评价指标列表 + 方法条件列表
@@ -1293,7 +1375,7 @@ def list_research_gaps(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         gaps = store.list_research_gaps(limit=200)
         stats = store.gap_stats()
     except Exception as e:  # noqa: BLE001
@@ -1336,7 +1418,7 @@ def list_research_conflicts(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         conflicts = store.list_research_conflicts(limit=200)
         stats = store.conflict_stats()
     except Exception as e:  # noqa: BLE001
@@ -1489,7 +1571,7 @@ def adjudicate_conflict(project_id: str, conflict_id: str, req: ConflictAdjudica
 
 
 @app.get("/api/projects/{project_id}/evidence")
-def list_evidence(project_id: str) -> dict:
+def list_evidence(project_id: str, limit: int = Query(10, ge=1, le=30), offset: int = Query(0, ge=0)) -> dict:
     """获取检索证据链（审计轨迹：query → source → 命中 → paper 关联）。
 
     文献调研可溯源：Sciverse 调用记录天然构成证据链。
@@ -1497,8 +1579,15 @@ def list_evidence(project_id: str) -> dict:
     证据分、片段摘要，以及是否关联到已入库论文。
     """
     _require_project(project_id)
+    if not _CONFIG.paths.project_db(project_id).is_file():
+        raise HTTPException(status_code=404, detail="项目数据库不存在，未创建空白数据替代历史项目")
+    from core.workspace.conversations import ConversationService
+    from core.workspace.read_model import search_audits
+    # Keep the old entries/stats contract while exposing the new task's own
+    # source calls and server-authored coverage. No migration or model call.
+    audit = search_audits(ConversationService(project_id, _CONFIG.paths.project_db(project_id)), limit=limit, offset=offset)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         entries = store.list_evidence(limit=500)
         stats = store.evidence_stats()
     except Exception as e:  # noqa: BLE001
@@ -1506,8 +1595,9 @@ def list_evidence(project_id: str) -> dict:
             "entries": [],
             "stats": {"total": 0, "by_source": {}, "linked": 0},
             "error": f"读取失败: {e}",
+            "conversation_search": audit,
         }
-    return {"entries": entries, "stats": stats}
+    return {"entries": entries, "stats": stats, "conversation_search": audit}
 
 
 @app.get("/api/projects/{project_id}/unlinked-papers")
@@ -1525,7 +1615,7 @@ def list_unlinked_papers(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         entries = store.list_unlinked_evidence(limit=500)
         papers_all = store.list_papers()
     except Exception as e:  # noqa: BLE001
@@ -2075,7 +2165,7 @@ def download_paper_pdf(project_id: str, paper_id: str):
 def list_claims(project_id: str, status: Optional[str] = None) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         claims = store.list_claims()
     except Exception as e:  # noqa: BLE001
         return {"claims": [], "error": f"读取失败: {e}"}
@@ -2121,7 +2211,7 @@ def list_claims(project_id: str, status: Optional[str] = None) -> dict:
 def list_experiments(project_id: str) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         exps = store.list_experiments()
     except Exception as e:  # noqa: BLE001
         return {"experiments": [], "error": f"读取失败: {e}"}
@@ -2304,6 +2394,11 @@ def get_experiment_tasks(project_id: str) -> dict:
 
 @app.post("/api/projects/{project_id}/experiments/backfill")
 def backfill_experiment_results(project_id: str, req: ExperimentBackfillRequest) -> dict:
+    _require_project(project_id)
+    raise HTTPException(status_code=422,detail=NOTICE)
+
+
+def _backfill_experiment_results_internal(project_id: str, req: ExperimentBackfillRequest) -> dict:
     """回填实验结果：解析 results.json 结构，按 name 匹配更新实验状态与指标。
 
     status 映射：success → completed，failed → failed，inconclusive → anomaly_detected。
@@ -2413,7 +2508,7 @@ def add_note(project_id: str, req: NoteRequest) -> dict:
 @app.get("/api/projects/{project_id}/notes")
 def list_notes(project_id: str) -> dict:
     state = _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
     state.notes = _merged_project_notes(store, state)
     return {"notes": list(state.notes)}
 
@@ -2421,6 +2516,9 @@ def list_notes(project_id: str) -> dict:
 @app.post("/api/projects/{project_id}/human-response")
 def submit_human_response(project_id: str, req: HumanResponseRequest) -> dict:
     state = _require_project(project_id)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"]:
+        raise HTTPException(status_code=422,detail=boundary["message"])
     action = req.action or "continue"
     if action not in ("continue", "abort", "rollback"):
         raise HTTPException(status_code=400, detail="action 必须为 continue/abort/rollback")
@@ -2461,7 +2559,7 @@ def get_research_report(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         cv_report = store.get_kv("cross_validation_report")
     except Exception as e:  # noqa: BLE001
         return {"report": None, "error": f"读取失败: {e}"}
@@ -2490,7 +2588,7 @@ def get_dashboard(project_id: str) -> dict:
     """
     state = _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         counts = {
             "papers": len(store.list_papers()),
             "ideas": len(store.list_ideas()),
@@ -2513,13 +2611,9 @@ def get_dashboard(project_id: str) -> dict:
     # 阶段状态
     stage_statuses: dict[str, str] = {}
     current_stage = ""
-    try:
-        session = ProjectSession.load(project_id, _CONFIG.paths)
-        current_stage = session.current_stage().value
-        for stage in LifecycleStage.ordered():
-            stage_statuses[stage.value] = session.status_of(stage).value
-    except Exception:  # noqa: BLE001
-        pass
+    boundary = inspect_boundary(_CONFIG.paths,project_id)
+    current_stage = historical_stage(boundary)
+    stage_statuses = {s.value:boundary["stage_statuses"].get(s.value,"not_started") for s in LifecycleStage.ordered()}
 
     workflow = _workspace_workflow(state,store,stage_statuses)
     counts["writing_artifacts"] = writing_summary["artifact_count"]
@@ -2542,6 +2636,8 @@ def get_dashboard(project_id: str) -> dict:
         },
         "writing_summary": writing_summary,
         "pending_human": _BRIDGE.get_pending(project_id),
+        "product_stage":workflow["product_stage"],
+        "product_boundary":workflow["product_boundary"],
         "continuation": workflow["continuation"],
         "workflow": workflow,
         "run_mode": state.run_mode,
@@ -2552,7 +2648,7 @@ def get_dashboard(project_id: str) -> dict:
 
 
 @app.get("/api/projects/{project_id}/download/{artifact_type}")
-def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
+def download_artifact(project_id: str, artifact_type: str, format: str = "md", preserve_status: bool = False):
     """下载关键产出物，支持 md / docx / pdf 三种格式。
 
     支持类型：
@@ -2567,7 +2663,7 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
     - full-report：全流程综合报告
     """
     _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
 
     # 实验任务说明书（系统不交付代码，交付物为任务说明书）
     if artifact_type in ("experiment-tasks", "experiment-code"):
@@ -2580,6 +2676,8 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
                 "# 实验任务说明书\n\n> 尚未导出实验任务包，请先运行 experiment 阶段"
                 "并在人工审核节点确认导出。"
             )
+        if preserve_status:
+            md_content = _download_status_note(store, project_id, artifact_type) + md_content
         return _make_download(md_content, "experiment_tasks.md", "text/markdown", format)
 
     # 其余类型先统一生成 Markdown 内容
@@ -2617,7 +2715,7 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
         try:
             from core.artifacts import ArtifactManager
             from core.knowledge import ArtifactType
-            am = _artifact_manager(project_id)
+            am = _artifact_manager(project_id,read_only=True)
             arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
             if arts:
                 md_content = am.read_content(arts[-1]) or ""
@@ -2637,7 +2735,7 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
         try:
             from core.artifacts import ArtifactManager
             from core.knowledge import ArtifactType
-            am = _artifact_manager(project_id)
+            am = _artifact_manager(project_id,read_only=True)
             arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
             if arts:
                 md_content = am.read_content(arts[-1]) or str(arts[-1].content or "")
@@ -2666,6 +2764,8 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
     else:
         raise HTTPException(status_code=400, detail=f"不支持的下载类型: {artifact_type}")
 
+    if preserve_status:
+        md_content = _download_status_note(store, project_id, artifact_type) + md_content
     # 按格式转换
     fmt = (format or "md").lower()
     if fmt == "docx":
@@ -2674,6 +2774,23 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
         return _md_to_pdf_response(md_content, base_filename)
     else:
         return _make_download(md_content, f"{base_filename}.md", "text/markdown", "md")
+
+
+def _download_status_note(store, project_id, kind):
+    historical = kind in ("experiment-tasks", "experiment-code", "experiment-results", "paper-draft", "claims-summary", "discovery-report")
+    note = f"# 导出说明\n\n项目：{project_id}\n\n状态：{'历史产物，非本轮新增成果' if historical else '已有研究材料，尚待审阅'}\n\n> 本轮止于研究方案，保存、汇总及下载不表示已执行实验或结论得到验证。\n\n"
+    fields = ("mode", "status", "data_mode", "run_mode", "dry_run", "is_demo", "demo", "is_teaching", "case_id", "simulated", "needs_review", "result_origin", "provenance")
+    sources = []
+    if kind == "research-report":
+        sources.append(store.get_kv("cross_validation_report") or {})
+    if kind == "experiment-results":
+        sources.extend(e.config for e in store.list_experiments())
+    for source in sources:
+        if isinstance(source, dict):
+            markers = {key:source[key] for key in fields if key in source}
+            if markers:
+                note += "原始状态／来源标记（保持原值，不补造真实性）：\n\n```json\n" + json.dumps(markers, ensure_ascii=False, indent=2) + "\n```\n\n"
+    return note + "---\n\n"
 
 
 def _build_research_report_md(report: dict, store: Optional[KnowledgeStore] = None) -> str:
@@ -3115,7 +3232,7 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
     try:
         from core.artifacts import ArtifactManager
         from core.knowledge import ArtifactType
-        am = _artifact_manager(project_id)
+        am = _artifact_manager(project_id,read_only=True)
         arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
         if arts:
             content = am.read_content(arts[-1]) or str(arts[-1].content or "")
@@ -3134,7 +3251,7 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
     try:
         from core.artifacts import ArtifactManager
         from core.knowledge import ArtifactType
-        am = _artifact_manager(project_id)
+        am = _artifact_manager(project_id,read_only=True)
         arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
         if arts:
             content = am.read_content(arts[-1]) or str(arts[-1].content or "")
@@ -3159,7 +3276,7 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
         parts.append(discovery_content)
 
     from core.workspace.service import WorkspaceService
-    workspace = WorkspaceService(project_id,_CONFIG.paths.project_db(project_id))
+    workspace = WorkspaceService(project_id,_CONFIG.paths.project_db(project_id),initialize_store=False)
     if workspace.load().items:
         parts.append("\n\n---\n\n# 第八部分：当前研究主线与用户记录\n\n")
         parts.append("以下含计划、骨架及可能的演示假设；以各记录标记为准，不将预期数据算作真实实验结果。\n\n")
@@ -3497,33 +3614,78 @@ async def upload_paper(
     project_id: str,
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
+    request_id: Optional[str] = Form(None, max_length=128),
 ):
+    from core.workspace.uploads import UploadService,UploadError
+    from starlette.concurrency import run_in_threadpool
+    _require_project(project_id)
+    raw = await file.read()
+    rid = request_id or uuid.uuid4().hex
+    filename = file.filename or "uploaded.txt"
+    try:
+        service = UploadService(_CONFIG.paths.project_db(project_id),project_id)
+        result = await run_in_threadpool(service.process,rid,filename,raw,title,
+            lambda capture,paper_id: _prepare_upload(project_id,raw,filename,title,capture,paper_id))
+        return JSONResponse(status_code=202 if result["status"]=="processing" else 200,content=result)
+    except UploadError as exc:
+        raise HTTPException(exc.code,detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/upload-requests/{request_id}")
+def upload_request_state(project_id: str,request_id: str):
+    from core.workspace.uploads import UploadService,UploadError
+    _require_project(project_id)
+    try:
+        return UploadService(_CONFIG.paths.project_db(project_id),project_id).status(request_id)
+    except UploadError as exc:
+        raise HTTPException(exc.code,detail=str(exc)) from exc
+
+
+def _prepare_upload(project_id,raw,filename,title,store,paper_id):
     """上传 PDF/文本文献，入库为 Paper 实体。
 
-    支持 .pdf / .txt / .md 文件。PDF 仅存储元信息（不做 OCR），
-    txt/md 直接作为摘要与 chunk 素材。
+    支持 .pdf / .txt / .md 文件。PDF 按现有解析能力提取片段，
+    txt/md 保存正文片段，开头节选不是论文摘要或全文核验。
     """
     _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-
-    # 读取文件内容
-    raw = await file.read()
-    filename = file.filename or "uploaded.txt"
+    db = _CONFIG.paths.project_db(project_id)
+    if not db.is_file():
+        raise HTTPException(404, detail="项目数据库不存在，未创建空白数据替代历史项目")
+    if filename != Path(filename).name or any(c in filename for c in ("/", "\\", ":")):
+        raise HTTPException(400, detail="文件名不能包含目录或路径，请重命名后上传")
     ext = Path(filename).suffix.lower()
-
-    paper_id = f"paper_{uuid.uuid4().hex[:12]}"
+    if ext not in (".pdf", ".txt", ".md"):
+        raise HTTPException(400, detail=f"不支持的文件类型: {ext}")
+    if not raw:
+        raise HTTPException(400, detail="文件为空，请选择包含正文的文件")
+    text_content = ""
+    if ext in (".txt", ".md"):
+        try:
+            text_content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, detail="文本不是有效 UTF-8，请转换编码后重试") from exc
+        if not text_content.strip():
+            raise HTTPException(400, detail="文件没有可读取的正文")
     abstract = ""
     pdf_path = None
     parse_mode = "none"
     sections_count = 0
     figures_count = 0
+    mineru_doc = None
+    parse_error = None
 
     if ext == ".pdf":
         # PDF：保存到项目目录，调用 MinerU 解析结构化内容（推荐工具）
         upload_dir = _CONFIG.paths.project_dir(project_id) / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = upload_dir / filename
-        pdf_path.write_bytes(raw)
+        # A new upload must not overwrite the file backing an older paper.
+        pdf_path = upload_dir / (paper_id + "_" + filename)
+        pending_path = pdf_path.with_suffix(pdf_path.suffix+".part")
+        with pending_path.open("wb") as pending_file:
+            pending_file.write(raw)
+            pending_file.flush()
+            os.fsync(pending_file.fileno())
+        os.replace(pending_path,pdf_path)
 
         # MinerU 解析（无 API key 时降级到 pypdf fallback）
         from core.tools import parse_pdf_with_mineru, mineru_is_available
@@ -3536,7 +3698,9 @@ async def upload_paper(
                 # 优先使用 MinerU 抽取的 title
                 extracted_title = mineru_doc.title if mineru_doc.title else None
                 # 拼接前 2000 字作为 abstract
-                abstract = mineru_doc.full_text[:2000] if mineru_doc.full_text else f"(MinerU {parse_mode} 解析: {filename})"
+                abstract = mineru_doc.full_text[:2000] if mineru_doc.full_text else ""
+                if not abstract.strip():
+                    parse_error = "PDF 已保存，但未提取到可读取正文，请补充文本或核对文件"
                 # 把 MinerU 解析的结构化数据存入 KV（前端可视化与 discovery 阶段使用）
                 store.save_kv(f"mineru_{paper_id}", {
                     "title": mineru_doc.title,
@@ -3553,18 +3717,17 @@ async def upload_paper(
                 })
                 if extracted_title and not title:
                     title = extracted_title
-            except Exception as e:
+            except Exception:
                 parse_mode = "error"
-                abstract = f"(MinerU 解析失败: {e}，需手动提取文本)"
+                abstract = ""
+                parse_error = "PDF 已保存，但解析失败；未读取正文，请补充文本后讨论"
         else:
             parse_mode = "fallback"
-            abstract = f"(PDF 文件已上传: {filename}，未启用 MinerU 解析，需手动提取文本)"
+            parse_error = "PDF 已保存，解析服务未启用；仅有元信息，请补充文本"
 
     elif ext in (".txt", ".md"):
         parse_mode = "text"
-        abstract = raw.decode("utf-8", errors="replace")[:5000]
-    else:
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+        abstract = text_content[:5000]
 
     from core.knowledge import Paper
     # 清理文件名/标题中可能残留的前端 HTML 标签
@@ -3577,6 +3740,15 @@ async def upload_paper(
         url=None,
         pdf_path=str(pdf_path) if pdf_path else None,
         source_stage="upload",
+        metadata={
+            "parse_mode": parse_mode,
+            "parse_error": parse_error,
+            "reading_scope": (
+                "用户上传文本：已保存正文片段，展示为开头节选，不等于论文摘要或已核验全文"
+                if text_content else
+                "PDF 提取片段：未确认全文完整性" if abstract else "仅元信息；未读取正文"
+            ),
+        },
     )
     store.save_paper(paper)
 
@@ -3598,10 +3770,10 @@ async def upload_paper(
 
     # txt/md 内容切分为 chunk（PDF 由 MinerU 解析后也会按 section 切分）
     chunk_count = 0
-    if ext in (".txt", ".md") and abstract:
+    if ext in (".txt", ".md") and text_content:
         from core.tools import split_into_chunks
         from core.knowledge import PaperChunk
-        text_chunks = split_into_chunks(abstract, max_tokens=500, overlap_tokens=50)
+        text_chunks = split_into_chunks(text_content, max_tokens=500, overlap_tokens=50)
         paper_chunks = [
             PaperChunk(
                 chunk_id=f"{paper_id}_c{tc.index}",
@@ -3614,12 +3786,10 @@ async def upload_paper(
         if paper_chunks:
             store.save_paper_chunks(paper_chunks)
             chunk_count = len(paper_chunks)
-    elif ext == ".pdf" and parse_mode != "none" and parse_mode != "error":
+    elif mineru_doc is not None and abstract:
         # MinerU 解析后按 section 切分 chunk（结构化优于字符切分）
         try:
-            from core.tools import parse_pdf_with_mineru
             from core.knowledge import PaperChunk
-            mineru_doc = parse_pdf_with_mineru(pdf_path)
             paper_chunks = []
             for i, sec in enumerate(mineru_doc.sections):
                 if not sec.text or len(sec.text.strip()) < 20:
@@ -3646,7 +3816,9 @@ async def upload_paper(
         "parse_mode": parse_mode,
         "sections_count": sections_count,
         "figures_count": figures_count,
-        "message": "文献上传成功",
+        "reading_scope": paper.metadata["reading_scope"],
+        "parse_error": parse_error,
+        "message": parse_error or "文献上传成功，可基于已保存片段讨论",
     }
 
 
@@ -3668,14 +3840,14 @@ async def upload_topic(
 # ===== 辅助 =====
 
 
-def _artifact_manager(project_id: str):
+def _artifact_manager(project_id: str, *, read_only=False):
     """构造项目级 ArtifactManager（元数据 store + 内容文件 store）。
 
     此前多处 ArtifactManager(db_path) 少传 content_store，一调用就 TypeError
     被 except 吞掉，导致方法文档/论文稿永远显示「暂无」。
     """
     from core.artifacts import ArtifactContentStore, ArtifactManager
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=read_only)
     content_store = ArtifactContentStore(_CONFIG.paths.project_artifacts(project_id))
     return ArtifactManager(store, content_store)
 
@@ -3694,6 +3866,8 @@ def _require_project(project_id: str) -> ProjectState:
                 "。请核对项目编号及当前服务的数据目录；不要通过新建项目覆盖原项目。"
             ),
         )
+    if not _CONFIG.paths.project_db(project_id).is_file():
+        raise HTTPException(404,"项目数据库不存在，未创建空白数据替代历史项目")
     return state
 
 
@@ -3701,8 +3875,45 @@ def _require_project(project_id: str) -> ProjectState:
 
 
 from web.workspace_api import build_workspace_router  # noqa: E402
+from web.conversation_home_api import build_home_router  # noqa: E402
+from web.project_exports_api import build_exports_router  # noqa: E402
+
+
+def _register_conversation_project(pid, topic, domain, created_at):
+    with _LOCK:
+        if pid not in _PROJECTS:
+            store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
+            _PROJECTS[pid] = ProjectState(project_id=pid,topic=store.get_kv("research.topic",topic),domain=store.get_kv("project.domain",domain),created_at=created_at,
+                                          display_name=store.get_kv("project.display_name",topic))
+
+
+app.include_router(build_home_router(lambda:_CONFIG,_require_project,_register_conversation_project))
+app.include_router(build_exports_router(lambda:_CONFIG, _require_project,
+    lambda state:_workspace_workflow(state,include_materials=True), download_artifact,
+    _make_download, _md_to_docx_response, _md_to_pdf_response))
 
 app.include_router(build_workspace_router(_CONFIG, _require_project,workflow_provider=lambda state:_workspace_workflow(state,include_materials=True)))
+
+
+@app.middleware("http")
+async def teaching_execution_boundary(request, call_next):
+    """Old execution/import endpoints cannot turn a saved lesson into live work."""
+    import re
+    from fastapi.responses import JSONResponse
+    from core.workspace.conversations import ConversationService
+    from core.workspace.teaching import teaching_identity
+    match = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/(.+)$", request.url.path)
+    if request.method in ("POST", "PUT") and match:
+        pid, tail = match.groups()
+        blocked = tail in {"run", "resume", "run-topic-discovery", "regenerate-method-doc", "human-response", "papers/import", "upload-paper", "upload-topic", "workspace/guide"} or "research-tasks" in tail
+        db = _CONFIG.paths.project_db(pid)
+        if blocked and db.is_file():
+            try:
+                if teaching_identity(ConversationService(pid, db)):
+                    return JSONResponse(status_code=422, content={"detail": "教学体验不执行实时检索、生成或实验。请明确转为自己的普通研究后操作。"})
+            except ValueError:
+                pass  # The owning endpoint reports storage/ownership errors.
+    return await call_next(request)
 
 
 @app.get("/workspace")

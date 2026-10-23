@@ -6,6 +6,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["SRA_WEB_SKIP_GUARD"] = "1"
+os.environ["SRA_WEB_SKIP_PROJECT_SCAN"] = "1"
 os.environ["SRA_DRY_RUN"] = "true"
 
 import core.config as configuration

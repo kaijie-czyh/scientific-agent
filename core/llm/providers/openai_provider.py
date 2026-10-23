@@ -9,9 +9,12 @@
 - 退化为 response_format=json_object + prompt 引导
 - 最终用 Pydantic 校验，失败则抛 LLMError
 """
+
 from __future__ import annotations
 
 import json
+import time
+from contextvars import ContextVar
 from typing import Any, Optional, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -35,6 +38,7 @@ class OpenAIProvider(LLMProvider):
     """OpenAI 兼容 Provider。"""
 
     provider_name = "openai"
+    audited_transport = True
 
     def __init__(
         self,
@@ -43,15 +47,26 @@ class OpenAIProvider(LLMProvider):
         timeout: int = 120,
         max_retries: int = 3,
         provider_name: str = "openai",
+        http_client=None,
     ):
         try:
-            from openai import OpenAI
+            from openai import OpenAI, DefaultHttpxClient
         except ImportError as e:
-            raise ImportError(
-                "未安装 openai 包，请运行: pip install openai"
-            ) from e
+            raise ImportError("未安装 openai 包，请运行: pip install openai") from e
 
-        kwargs: dict[str, Any] = {"timeout": timeout, "max_retries": max_retries}
+        # Disable SDK-internal retries. Each network attempt passes the actual
+        # SDK client's hooks, including failures; no httpx-version assumptions.
+        self._retries = max(0, min(3, max_retries))
+        self._pending = ContextVar("sra_model_attempts_" + str(id(self)), default=None)
+        client = http_client or DefaultHttpxClient(follow_redirects=False)
+        client.follow_redirects = False
+        client.event_hooks["request"].append(self._before_http)
+        client.event_hooks["response"].append(self._after_http)
+        kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "max_retries": 0,
+            "http_client": client,
+        }
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:
@@ -60,10 +75,99 @@ class OpenAIProvider(LLMProvider):
         self._base_url = base_url
         self.provider_name = provider_name
 
+    def _before_http(self, request):
+        from core.invocation_audit import ACTIVE
+
+        scope = ACTIVE.get()
+        if not scope:
+            return
+        payload = json.loads(request.content)
+        reserved = None
+        if scope.pricing:
+            # UTF-8 bytes is a deliberately conservative input token reservation,
+            # not a reported tokenizer usage. Output includes reasoning budget.
+            reserved = (
+                len(request.content) * scope.pricing["input"]
+                + payload.get("max_tokens", 0) * scope.pricing["output"]
+            ) / 1_000_000
+        ticket = scope.begin(
+            "network", "model", payload.get("model", "unknown"), reserved_cost=reserved
+        )
+        pending = self._pending.get()
+        if pending is not None:
+            pending.append((id(request), scope, ticket))
+
+    def _after_http(self, response):
+        from core.tools.search_result import retry_delay
+
+        for identity, scope, ticket in self._pending.get() or []:
+            if identity != id(response.request):
+                continue
+            response.read()
+            usage = None
+            if response.status_code == 200:
+                try:
+                    usage = response.json().get("usage")
+                except (ValueError, AttributeError):
+                    pass
+            scope.finish(
+                ticket,
+                outcome="success" if response.status_code < 300 else "http_error",
+                http_status=response.status_code,
+                usage=usage,
+                retry_after=retry_delay(response.headers.get("Retry-After")),
+            )
+
+    def _request(self, fn, **kwargs):
+        from core.invocation_audit import CallLimitError
+        from core.tools.search_result import retry_delay
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        token = self._pending.set([])
+        try:
+            for attempt in range(self._retries + 1):
+                try:
+                    return fn(**kwargs)
+                except Exception as exc:
+                    for _, scope, ticket in self._pending.get():
+                        scope.finish(ticket, outcome=type(exc).__name__)
+                    cause = exc
+                    while cause:
+                        if isinstance(cause, CallLimitError):
+                            raise cause
+                        cause = cause.__cause__
+                    code = getattr(exc, "status_code", None)
+                    retryable = (
+                        isinstance(exc, (APIConnectionError, APITimeoutError))
+                        or isinstance(exc, APIStatusError)
+                        and (code in (408, 409, 429) or code >= 500)
+                    )
+                    response = getattr(exc, "response", None)
+                    delay = (
+                        retry_delay(response.headers.get("Retry-After"))
+                        if response is not None
+                        else None
+                    )
+                    # Do not sleep for long server cooldowns or retry tightly.
+                    from core.invocation_audit import ACTIVE
+
+                    if (
+                        (ACTIVE.get() and ACTIVE.get().stop_on_model_failure)
+                        or not retryable
+                        or attempt >= self._retries
+                        or delay is not None
+                        and delay > 2
+                    ):
+                        raise
+                    time.sleep(max(delay or 0, min(2, 2**attempt)))
+        finally:
+            self._pending.reset(token)
+
     def complete(self, request: LLMRequest, model: str) -> LLMResponse:
         messages = self._build_messages(request)
         try:
-            resp = self._client.chat.completions.create(
+            resp = self._request(
+                self._client.chat.completions.create,
                 model=model,
                 messages=messages,
                 temperature=request.temperature,
@@ -71,7 +175,9 @@ class OpenAIProvider(LLMProvider):
                 stop=request.stop,
             )
         except Exception as e:
-            raise LLMError(f"OpenAI complete 调用失败: {e}") from e
+            raise LLMError(
+                f"模型请求失败 [{type(e).__name__}]，请查看原请求状态后明确重试"
+            ) from e
 
         text = resp.choices[0].message.content or ""
         # 剥离推理模型（MiniMax-M3 / glm-5.3-flash 等）拼进 content 的 <think> 思考链，只留最终答复
@@ -89,7 +195,8 @@ class OpenAIProvider(LLMProvider):
 
     def embed(self, request: EmbeddingRequest, model: str) -> EmbeddingResponse:
         try:
-            resp = self._client.embeddings.create(
+            resp = self._request(
+                self._client.embeddings.create,
                 model=model,
                 input=request.texts,
             )
@@ -114,7 +221,8 @@ class OpenAIProvider(LLMProvider):
         messages = self._build_messages_for_structured(request, schema)
 
         try:
-            resp = self._client.chat.completions.create(
+            resp = self._request(
+                self._client.chat.completions.create,
                 model=model,
                 messages=messages,
                 temperature=request.temperature,
@@ -122,10 +230,20 @@ class OpenAIProvider(LLMProvider):
                 response_format={"type": "json_object"},
             )
         except Exception as e:
-            raise LLMError(f"OpenAI structured_output 调用失败: {e}") from e
+            raise LLMError(
+                f"方案模型请求失败 [{type(e).__name__}]，原消息已保留，请核对状态后明确重试"
+            ) from e
 
+        from core.invocation_audit import span
+        with span("phase", "model", "structure_validation"):
+            return self._parse_structured(resp, request)
+
+    def _parse_structured(self, resp, request):
+        schema = request.output_schema
         if resp.choices[0].finish_reason == "length":
-            raise LLMTruncatedError(f"模型结构化输出被截断（预算 {request.max_tokens} token，含推理消耗）")
+            raise LLMTruncatedError(
+                f"模型结构化输出被截断（预算 {request.max_tokens} token，含推理消耗）"
+            )
         text = strip_think_tags(resp.choices[0].message.content or "")
         # 提取 JSON：处理 markdown 代码块包裹、前置说明文字等情况
         text = self._extract_json(text)
@@ -227,9 +345,7 @@ class OpenAIProvider(LLMProvider):
             field_hints.append(f'- "{name}": {desc}')
         hints_text = "\n".join(field_hints) if field_hints else ""
 
-        system = (
-            request.system or ""
-        ) + (
+        system = (request.system or "") + (
             "\n\n请基于用户请求生成**实例数据**（不是 schema 定义本身），"
             "返回一个符合以下 JSON Schema 的 JSON 对象。\n"
             "硬性要求：\n"

@@ -81,12 +81,10 @@ _cleanup_*.py
 _cmp_repo_kaijie/
 _cmp_work/
 
-# Python package entry points must not match the temporary _*.py rule
-!__init__.py
-
-# Local assistant state, temporary test directories and private notes
-.workbuddy/
+# 本地审查与临时测试目录，不属于源码发行内容
+.pytest-*/
 .pytest*/
+.workbuddy/
 .trae-html-share-packages/
 pytest_report.xml
 tests/last_full_report.json
@@ -95,3 +93,8 @@ docs/acceptance-test-results.xml
 discovery_real_log.txt
 materials_run_log.txt
 对话留存.md
+*.db-wal
+*.db-shm
+
+# 包入口不属于临时 _*.py 脚本
+!__init__.py

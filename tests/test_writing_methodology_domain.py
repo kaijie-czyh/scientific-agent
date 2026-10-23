@@ -37,7 +37,9 @@ def test_conflict_report_schema_has_landscape():
     s = ConflictReportSchema()
     assert s.landscape == ""
     s2 = ConflictReportSchema(landscape="a; b; c")
-    assert "领域脉络" in (ConflictReportSchema.model_fields["landscape"].description or "")
+    assert "领域脉络" in (
+        ConflictReportSchema.model_fields["landscape"].description or ""
+    )
 
 
 def test_data_driven_detect_domain_wording(tmp_path):
@@ -52,6 +54,7 @@ def test_data_driven_detect_domain_wording(tmp_path):
     # 措辞函数级验证：非材料领域不含「材料」「合成工艺」字样的模板词
     # （通过构造最小对象太重，这里检查方法源码中的通用化变量）
     import inspect
+
     src = inspect.getsource(ResearchGapIdentifyAgent._data_driven_detect)
     assert "_entity_word" in src and "_method_word" in src
 
@@ -74,7 +77,9 @@ def test_writing_methodology_module():
     assert build_stage_writing_hint("unknown_stage") == ""
     # 领域标签注入
     hint = build_stage_writing_hint("writing", domain="ai")
-    assert "人工智能" in hint
+    from core.research_scope import PUBLIC_DOMAINS
+
+    assert PUBLIC_DOMAINS["ai"] in hint
 
 
 def test_writing_agents_inject_p0():

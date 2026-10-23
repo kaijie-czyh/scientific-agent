@@ -27,6 +27,7 @@ def test_report_badge_uses_report_items_not_all_research_gaps(project):
     status = api.get_status(state.project_id)
     assert status["counts"]["gaps"] == 7
     assert status["counts"]["report_gaps"] == len(api.get_research_report(state.project_id)["report"]["gaps"]) == 2
+    assert status['material_counts']['research_reports']==1
 
 
 def test_status_notes_count_matches_deduplicated_list_without_writing(project):
@@ -56,5 +57,7 @@ def test_page_renderers_do_not_directly_overwrite_navigation_badges():
     assert js.count('setBadge("badge-report-gaps",') == 1
     assert js.count('setBadge("badge-notes",') == 1
     assert 'state.notesCount ?? data.notes_count ?? null' in js
-    assert 'counts.report_gaps ?? state.reportGapsCount' in js
+    # Legacy report_gaps remains in HTTP counts; the actual navigation now
+    # counts saved reports, not candidate questions or versions.
+    assert 'materialCounts?.research_reports ?? null' in js
     assert 'else refreshReportBadgeCount(pid)' in js

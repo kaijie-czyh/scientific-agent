@@ -64,6 +64,23 @@ def branch(service):
     return q,p
 
 
+def test_workspace_with_real_workflow_provider_does_not_migrate_on_read(unified):
+    import sqlite3
+    from contextlib import closing
+    api,client,s,_=unified
+    branch(s)
+    with closing(sqlite3.connect(s.db_path)) as conn, conn:
+        conn.execute("DROP TABLE evidence_log")
+    before=s.db_path.read_bytes()
+    for path in ("workspace", "workspace?include_chat=false", "workspace/export?format=json"):
+        response=client.get(f"/api/projects/{s.project_id}/{path}")
+        assert response.status_code==200,response.text
+        assert s.db_path.read_bytes()==before
+    workspace=client.get(f"/api/projects/{s.project_id}/workspace").json()
+    assert workspace["workflow"]["flow"]["planReady"]
+    assert workspace["workflow"]["product_boundary"]["max_stage"]=="design"
+
+
 def test_reads_offer_existing_sources_without_adoption_or_experiment_writes(unified):
     api,client,s,_=unified
     before=[e.model_dump() for e in s.store.list_experiments()]
@@ -84,7 +101,8 @@ def test_explicit_link_is_idempotent_and_selection_survives_service_restart(unif
     assert restored.load().focus==ResearchFocus(question=q.item_id,plan=p.item_id)
     assert len(restored.load().items)==2
     assert s.store.get_experiment("exp-a").status==ExperimentStatus.PLANNED
-    assert s.workflow()["flow"]["next"]["kind"]=="result"
+    assert s.workflow()["flow"]["next"]["action"]=="plan_ready"
+    assert s.workflow()["flow"]["planReady"] is True
 
 
 def test_link_requires_confirmation_and_current_source(unified):
@@ -97,12 +115,12 @@ def test_link_requires_confirmation_and_current_source(unified):
     assert s.load().items==[]
 
 
-def test_primary_resume_opens_result_form_without_starting_worker(unified):
+def test_primary_resume_opens_plan_without_starting_worker(unified):
     api,client,s,_=unified
     q,p=branch(s)
     response=client.post(f"/api/projects/{s.project_id}/resume").json()
-    assert response["action"]=="results" and response["related_id"]==p.item_id
-    assert response["record_kind"]=="result"
+    assert response["action"]=="plan_ready" and response["record_id"]==p.item_id
+    assert response["record_kind"]=="plan"
     assert api._PROJECTS[s.project_id].thread is None
 
 
@@ -141,20 +159,23 @@ def test_result_revision_retains_history_and_synchronizes_new_value(unified):
     assert not by_id[replacement.item_id].needs_review
 
 
-def test_external_backfill_invalidates_linked_result_finding_and_outline(unified):
-    _,client,s,_=unified
+def test_external_backfill_invalidates_historical_dependents_but_public_write_is_closed(unified):
+    api,client,s,_=unified
     _,p=branch(s)
     r=item(s,"result","用户记录",related_ids=[p.item_id],result_status="completed",metrics={"accuracy":0.71})
     f=item(s,"finding","判断",related_ids=[r.item_id],assessment="inconclusive")
     o=item(s,"outline","提纲",related_ids=[f.item_id])
     response=client.post(f"/api/projects/{s.project_id}/experiments/backfill",json={"results_json":json.dumps({"experiments":[{"experiment_id":"exp-a","status":"completed","metrics":{"accuracy":0.65}}]})})
-    assert response.status_code==200
+    assert response.status_code==422
+    assert s.store.get_experiment("exp-a").metrics=={"accuracy":0.71}
+    # Simulate a historical external update through the internal validation path.
+    api._backfill_experiment_results_internal(s.project_id,api.ExperimentBackfillRequest(results_json=json.dumps({"experiments":[{"experiment_id":"exp-a","status":"completed","metrics":{"accuracy":0.65}}]})))
     by_id={i.item_id:i for i in s.load().items}
     assert all(by_id[i.item_id].needs_review for i in (r,f,o))
-    assert s.workflow()["continuation"]["action"]=="review_record"
+    assert s.workflow()["continuation"]["action"]=="plan_ready"
     updated=link(s,"experiment_result","exp-a",p.item_id)
     assert updated.metrics=={"accuracy":0.65} and updated.supersedes_id==r.item_id
-    assert s.workflow()["flow"]["next"]["kind"]=="finding"
+    assert s.workflow()["flow"]["next"]["action"]=="plan_ready"
 
 
 def test_cannot_borrow_results_from_another_task_or_select_other_question_plan(unified):
@@ -185,7 +206,7 @@ def test_guide_and_export_use_same_persisted_mainline(unified):
     q,p=branch(s)
     context=build_guide_context(s,"测试主题","overview",None,[])
     assert context["research_mainline"]["focus"]==s.load().focus.model_dump()
-    assert context["research_mainline"]["next_step"]["action"]=="results"
+    assert context["research_mainline"]["next_step"]["action"]=="plan_ready"
     body=client.get(f"/api/projects/{s.project_id}/download/full-report").text
     assert q.item_id in body and p.item_id in body and "来源材料" in body
 
@@ -207,9 +228,9 @@ def test_expected_outline_does_not_advance_experiment_or_scientific_completion(u
     _,_,s,_=unified
     _,p=branch(s)
     item(s,"outline","预期示例（非实测）",related_ids=[p.item_id])
-    assert s.workflow()["current_stage"]=="experiment"
+    assert s.workflow()["current_stage"]=="design"
     assert s.workflow()["counts"]["result"]==0
-    assert s.workflow()["continuation"]["action"]=="results"
+    assert s.workflow()["continuation"]["action"]=="plan_ready"
 
 
 def test_real_mode_forced_writing_is_rejected_before_start(unified):

@@ -131,8 +131,9 @@ def test_chat_is_persisted_but_suggestion_needs_user_adoption(workspace):
     other = WorkspaceService(workspace.project_id, workspace.db_path)
     doc = other.apply_suggestion(doc.suggestions[0].suggestion_id, doc.revision)
     assert doc.items[0].origin == "accepted_suggestion"
-    with pytest.raises(WorkspaceError, match="已经采纳"):
-        other.apply_suggestion(doc.suggestions[0].suggestion_id, doc.revision)
+    again=other.apply_suggestion(doc.suggestions[0].suggestion_id,doc.revision)
+    assert len(again.items)==1 and again.items[0].item_id==doc.items[0].item_id
+    assert again.revision==doc.revision
 
 
 def test_stale_suggestion_cannot_overwrite_new_research(workspace):
@@ -198,10 +199,18 @@ def test_api_rules_mode_does_not_call_model_and_requires_explicit_apply(tmp_path
     assert response.status_code == 200
     data = response.json()["workspace"]
     assert data["messages"][-1]["mode"] == "rules" and data["items"] == []
+    # Step 4B: ordinary discussion no longer manufactures a note every turn.
+    # Explicit saving still produces a draft and requires atomic user adoption.
+    assert data["suggestions"] == []
+    response = client.post("/api/projects/p1/workspace/guide", json={"expected_revision": data["revision"], "area": "question", "message": "请保存为笔记：先梳理联邦学习的隐私威胁"})
+    assert response.status_code == 200
+    data = response.json()["workspace"]
+    assert data["items"] == [] and len(data["suggestions"]) == 1
     assert client.post(f'/api/projects/p1/workspace/suggestions/{data["suggestions"][0]["suggestion_id"]}/apply', json={"expected_revision": data["revision"]}).status_code == 200
     assert client.get("/api/projects/p1/workspace/export?format=md").status_code == 200
     assert service.load().items[0].origin == "accepted_suggestion"
-    assert service.store.get_kv("research.topic") == "联邦学习"
+    # Read/guide routes no longer repair missing historical identity records.
+    assert service.store.get_kv("research.topic") is None
     assert client.get("/api/projects/other/workspace").status_code == 404
 
 
@@ -212,7 +221,9 @@ def test_api_model_failure_is_not_replaced_by_fake_guidance(tmp_path):
     client, service = client_for(tmp_path, dry_run=False, registry_factory=BrokenRegistry)
     response = client.post("/api/projects/p1/workspace/guide", json={"expected_revision": 0, "area": "overview", "message": "帮我判断"})
     assert response.status_code == 502
-    assert service.load().messages == [] and service.load().items == []
+    assert len(service.load().messages)==1 and service.load().messages[0].role=='user'
+    assert service.load().messages[0].request_status=='failed'
+    assert service.load().items==[] and service.load().revision==0
 
 
 def test_api_model_turn_receives_actual_project_context(tmp_path):
@@ -227,4 +238,7 @@ def test_api_model_turn_receives_actual_project_context(tmp_path):
     assert "联邦学习" in calls[0]["prompt"] and "已有材料" in calls[0]["system"]
     assert service.load().messages[-1].mode == "model"
     conflict = client.put("/api/projects/p1/workspace/brief", json={"expected_revision": 0, "brief": {"goal": "旧版本提交"}})
-    assert conflict.status_code == 409
+    # Chat no longer changes the research revision. The first formal write is valid.
+    assert conflict.status_code == 200
+    stale=client.put('/api/projects/p1/workspace/brief',json={'expected_revision':0,'brief':{'goal':'stale formal write'}})
+    assert stale.status_code==409

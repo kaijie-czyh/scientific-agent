@@ -108,8 +108,8 @@
         else if (state.area === "literature") renderPapers(main);
         else {
             if (state.area === "question") main.append(el("div", { class: "card accent" }, "先区分研究问题和预期结果。与已有工作有什么区别、目前还不能确定什么，都写进问题卡；不以模型分数代替文献核对。"));
-            if (state.area === "study") main.append(el("div", { class: "card accent" }, "问题 → 方案 → 用户执行与提交结果 → 用户判断。程序跑完不等于假设成立，反驳或无法定论的结果同样可以保存。"));
-            if (state.area === "writing") main.append(el("div", { class: "card accent" }, "本轮支持写作骨架与证据关联。背景和方法可以提前整理；缺少结果时保留待办，不填入预期数据。完整稿件生成将在后续接入。"));
+            if (state.area === "study") main.append(el("div", { class: "card accent" }, "确认问题 → 形成方案 → 审阅、修改与导出。本轮止于研究方案，历史结果与判断仅供查看。"));
+            if (state.area === "writing") main.append(el("div", { class: "card accent" }, "当前不进入论文写作；已有稿件、骨架和版本保留，可查看与导出，不生成或采纳新稿。"));
             renderRecords(main, AREA_KINDS[state.area]); main.append(recordEditor());
         }
     }
@@ -189,7 +189,7 @@
             if (sourceNames.length) card.append(el("p", { class: "record-meta" }, `关联论文：${sourceNames.join("；")}`));
             if (item.related_ids.length) card.append(el("p", { class: "record-meta" }, `关联记录：${item.related_ids.map(id => workspace().items.find(i => i.item_id === id)?.title || id).join("；")}`));
             card.append(el("div", { class: "button-row record-actions" }, [el("button", { type: "button", onclick: () => { state.selectedItem = item.item_id; renderGuide(); $("guide-input").focus(); } }, "围绕这条讨论"),
-                el("button", { type: "button", onclick: () => { state.editing = item.item_id; renderContent(); } }, "修订并保留旧版"), el("small", {}, new Date(item.created_at).toLocaleString())]));
+                ["note","question","plan"].includes(item.kind) ? el("button", { type: "button", onclick: () => { state.editing = item.item_id; renderContent(); } }, "修订并保留旧版") : null, el("small", {}, new Date(item.created_at).toLocaleString())]));
             main.append(card);
         });
         const history = workspace().items.filter(i => i.status === "superseded" && kinds.includes(i.kind));
@@ -197,7 +197,8 @@
     }
     function recordEditor() {
         const editing = activeItems().find(i => i.item_id === state.editing), key = formKey(), saved = getDraft(key);
-        const initial = { ...editing, ...saved }, choices = AREA_KINDS[state.area];
+        const initial = { ...editing, ...saved }, choices = AREA_KINDS[state.area].filter(k => ["note","question","plan"].includes(k));
+        if (state.area === "writing" || !choices.length || editing && !choices.includes(editing.kind)) return el("p", {class:"small muted"}, "历史材料仅供查看与导出。");
         const form = el("form", { class: "card editor" }, [el("h2", {}, editing ? "修订研究记录" : "记录当前成果")]);
         const kind = el("select", {}, choices.map(k => el("option", { value: k }, KINDS[k])));
         kind.value = choices.includes(initial.kind) ? initial.kind : choices[0]; kind.disabled = !!editing;
@@ -241,7 +242,7 @@
     function renderGuide(follow = false) {
         const thread = $("guide-messages"), previousScroll = thread.scrollTop;
         thread.replaceChildren(); $("guide-context").replaceChildren(); $("guide-starters").replaceChildren();
-        $("guide-send").disabled = !state.data || state.busy;
+        $("guide-send").disabled = !state.data || state.busy || state.area === "writing";
         $("guide-send").textContent = state.busy ? "正在思考…" : "发送";
         $("guide-input").disabled = !state.data;
         $("reading-purpose-label").hidden = state.area !== "literature" || !state.data;
@@ -262,7 +263,7 @@
                 const suggestion = workspace().suggestions.find(s => s.suggestion_id === id); if (!suggestion) return;
                 const stale = suggestion.based_on_revision !== workspace().revision;
                 const detail = el("details", { class: "suggestion" }, [el("summary", {}, `建议草案：${suggestion.title}`), el("p", {}, suggestion.content)]);
-                detail.append(el("button", { type: "button", disabled: !!suggestion.applied_item_id || stale || state.busy, onclick: async event => {
+                detail.append(el("button", { type: "button", disabled: ["result","finding","outline"].includes(suggestion.kind) || !!suggestion.applied_item_id || stale || state.busy, onclick: async event => {
                     event.target.disabled = true; const pid = state.projectId;
                     try { const data = await api(endpoint(`/suggestions/${id}/apply`), { expected_revision: workspace().revision }); if (pid === state.projectId) { state.data = data; renderAll(); } notify("已采纳为研究记录，可继续修改"); }
                     catch (error) { notify(error.message, true); renderGuide(); }
@@ -275,7 +276,7 @@
         thread.scrollTop = follow ? thread.scrollHeight : previousScroll;
     }
     $("guide-form").addEventListener("submit", async event => {
-        event.preventDefault(); if (!state.data || state.busy) return;
+        event.preventDefault(); if (!state.data || state.busy || state.area === "writing") return;
         const input = $("guide-input"), text = input.value.trim(); if (!text) return;
         const pid = state.projectId, area = state.area;
         const request = { expected_revision: workspace().revision, area, message: text, selected_item_id: state.selectedItem, selected_paper_ids: state.selectedPapers.slice(), reading_purpose: $("reading-purpose").value };

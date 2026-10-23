@@ -1,0 +1,116 @@
+"""Small HTTP additions for the main application; no alternative chat backend."""
+
+from contextlib import closing
+import json
+import sqlite3
+
+from fastapi import APIRouter, HTTPException
+from pydantic import Field, field_validator
+
+from core.research_scope import PUBLIC_DOMAINS
+from core.workspace.schema import Contract, now
+from core.workspace.start import ConversationStarter, StartConversation
+from core.workspace.conversations import ConversationNotFound, ConversationStorageError
+from core.workspace.service import WorkspaceError, RevisionConflict
+
+
+class ProjectName(Contract):
+    display_name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("display_name")
+    @classmethod
+    def nonblank(cls, value):
+        if not value.strip():
+            raise ValueError("项目名称不能为空白")
+        return value.strip()
+
+
+def build_home_router(configuration, require_project, register_project):
+    router = APIRouter(prefix="/api", tags=["conversation-home"])
+    config = lambda: configuration() if callable(configuration) else configuration
+    from web.teaching_case_api import build_teaching_router
+
+    teaching = build_teaching_router(configuration, require_project, register_project)
+    # Both routers already include /api: extend rather than add a second prefix.
+    router.routes.extend(teaching.routes)
+
+    @router.get("/conversation-capabilities")
+    def capabilities():
+        return {
+            "version": 1,
+            "project_conversations": True,
+            "durable_start": True,
+            "message_tail": True,
+            "catalog_navigation": True,
+            "conversation_search": True,
+            "project_exports": True,
+            "research_guidance": True,
+            "research_discussion_route": True,
+            "research_plan_templates": True,
+            "background_plan": True,
+            "upload_request_identity": True,
+            "call_audit": True,
+            "workspace_read_model": True,
+            "research_methods": [
+                {"value": "computational", "label": "计算研究"},
+                {"value": "theoretical", "label": "理论研究"},
+                {"value": "experimental", "label": "实验研究设计（仅规划）"},
+            ],
+            "research_search": True,
+            "automatic_search": False,
+            "case_content": True,
+            "teaching_cases": True,
+            "teaching_experience": 1,
+            "max_stage": "design",
+            "domains": [{"value": k, "label": v} for k, v in PUBLIC_DOMAINS.items()],
+        }
+
+    @router.post("/conversations/start")
+    def start(request: StartConversation):
+        try:
+            return ConversationStarter(
+                config().paths, require_project, register_project
+            ).start(request)
+        except WorkspaceError as exc:
+            code = (
+                404
+                if isinstance(exc, ConversationNotFound)
+                else (
+                    503
+                    if isinstance(exc, ConversationStorageError)
+                    else 409 if isinstance(exc, RevisionConflict) else 422
+                )
+            )
+            raise HTTPException(code, str(exc)) from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise HTTPException(
+                503, "开始对话的存储暂时不可用，请保留原 request_id 后核对重试"
+            ) from exc
+
+    @router.patch("/projects/{project_id}/identity")
+    def rename(project_id: str, request: ProjectName):
+        state = require_project(project_id)
+        db = config().paths.project_db(project_id)
+        if not db.is_file():
+            raise HTTPException(404, "项目数据库不存在，未创建空库替代原项目")
+        try:
+            with (
+                closing(
+                    sqlite3.connect(db.resolve().as_uri() + "?mode=rw", uri=True)
+                ) as conn,
+                conn,
+            ):
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_store(key,value,updated_at) VALUES (?,?,?)",
+                    (
+                        "project.display_name",
+                        json.dumps(request.display_name, ensure_ascii=False),
+                        now(),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise HTTPException(503, "项目名称暂时无法保存，请稍后重试") from exc
+        state.display_name = request.display_name
+        return {"project_id": project_id, "display_name": request.display_name}
+
+    return router

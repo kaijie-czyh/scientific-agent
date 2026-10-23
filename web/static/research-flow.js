@@ -5,10 +5,13 @@
         const items = workspace.items || [];
         const byId = new Map(items.map(item => [item.item_id, item]));
         const active = items.filter(item => item.status === "active");
+        const knownPapers = new Set(papers.map(paper => paper.paper_id));
         function usable(item, seen = new Set()) {
             if (!item || item.status !== "active" || item.needs_review || seen.has(item.item_id)) return false;
+            if (item.kind === "plan" && new Set((item.related_ids || []).filter(id => byId.get(id)?.kind === "question")).size !== 1) return false;
             const next = new Set(seen); next.add(item.item_id);
-            return (item.related_ids || []).every(id => usable(byId.get(id), next));
+            return (item.paper_ids || []).every(id => knownPapers.has(id))
+                && (item.related_ids || []).every(id => usable(byId.get(id), next));
         }
         function select(options, id) {
             return id ? options.find(item => item.item_id === id) || null : options.length === 1 ? options[0] : null;
@@ -32,7 +35,6 @@
             && (["supports", "refutes"].includes(item.assessment)
                 ? (item.related_ids || []).some(id => measuredIds.has(id)) : item.assessment === "inconclusive"));
         const branch = [question, plan, ...validResults, ...findings].filter(Boolean);
-        const knownPapers = new Set(papers.map(paper => paper.paper_id));
         const paperIds = [...new Set(branch.flatMap(item => item.paper_ids || []))];
         const issues = [];
         if (question && !(question.paper_ids || []).length) issues.push("当前问题尚未关联论文，研究依据仍需补充；这不阻止先保存待查证的想法。");
@@ -49,10 +51,9 @@
         else if (!usable(question)) next = {action: "revise", item: question, text: "问题或其依据已变化，先修订问题，再逐项核对下游方案与结果。"};
         else if (!plan) next = plans.length ? {action: "select", text: "当前问题有多个方案，请明确本次要推进哪一个。"} : {action: "create", kind: "plan", relatedId: question.item_id, text: "为当前问题保存方法方案，写清对照、数据条件、指标和支持／反驳标准。"};
         else if (!usable(plan)) next = {action: "revise", item: plan, text: "当前方案依赖已变化，先重新核对并修订方案，保留旧版本。"};
-        else if (!validResults.length) next = {action: "create", kind: "result", relatedId: plan.item_id, text: "按现有实验方式执行后，登记实际结果；没有执行就保持等待，不填写预测指标。"};
-        else if (!findings.length) next = {action: "create", kind: "finding", relatedId: validResults.length === 1 ? validResults[0].item_id : null, text: "结合当前方案的实际结果记录判断；运行失败或证据不足时，选择无法定论。"};
-        else next = {action: "discuss", item: findings[0], text: "已有问题、方案、结果与判断记录。下一步核对证据范围和局限，不代表创新成立或论文已完成。"};
-        return {questions, question, plans, plan, results, validResults, findings, steps, issues, next,
+        else next = {action: "plan_ready", item: plan, text: "方案已整理，可审阅、修改和导出；本轮止于研究方案，不进入实验或后续写作。"};
+        return {questions, question, plans, plan, results, validResults, findings, steps:steps.slice(0,2), historicalSteps:steps.slice(2), issues, next,
+            planReady:!!question && !!plan && usable(question) && usable(plan),
             paperIds, recordsReady: !!question && !!plan && usable(question) && usable(plan) && validResults.length > 0 && findings.length > 0};
     }
     const api = {analyze};

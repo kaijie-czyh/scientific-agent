@@ -1,6 +1,8 @@
 /* 原系统右侧指导：只管理自己的 DOM，以事件跟随原导航，复用项目和灵感笔记。 */
 (() => {
     "use strict";
+    // Never silently route a selected conversation into legacy default chat.
+    if (window.SRA_CONVERSATIONS) return;
     const $ = id => document.getElementById(id);
     const BASE = window.SRA_API_BASE || "";
     const PAGES = Object.fromEntries(Object.entries(window.SRA_NAVIGATION.pages).map(([id,p])=>[id,[p.title,p.area]]));
@@ -41,6 +43,7 @@
     }
     function renderContext() {
         const unsupported=s.data?.research_scope?.supported===false;
+        const readOnlyWriting=area()==="writing";
         const selected=s.data?.workspace.items.find(item=>item.item_id===s.selected);
         $("rg-focus").hidden=!selected;
         $("rg-focus").textContent=selected ? `讨论参考：${selected.title}（研究记录，非已验证结论）` : "";
@@ -51,8 +54,8 @@
         prompts.slice(0,2).forEach(text => {
             const b=el("button","",text); b.type="button"; b.onclick=()=>{ $("rg-input").value=text; s.inputVersion++; sessionStorage.setItem(key(s.pid),text); $("rg-input").focus(); }; starters.append(b);
         });
-        $("rg-send").disabled=!s.data || s.busy || unsupported; $("rg-send").textContent=s.busy ? "思考中…" : "发送";
-        $("rg-send").title=unsupported ? "该历史领域暂不提供新指导；已有对话、笔记与研究材料保留。" : "";
+        $("rg-send").disabled=!s.data || s.busy || unsupported || readOnlyWriting; $("rg-send").textContent=s.busy ? "思考中…" : readOnlyWriting ? "历史写作（仅查看）" : "发送";
+        $("rg-send").title=readOnlyWriting ? "当前产品止于研究方案，不生成新提纲或稿件；可回到方案页面讨论。" : unsupported ? "该历史领域暂不提供新指导；已有对话、笔记与研究材料保留。" : "";
     }
     function renderMaterials() {
         const box=$("rg-materials"); box.replaceChildren();
@@ -106,7 +109,8 @@
                 const item=s.data.workspace.suggestions.find(x=>x.suggestion_id===id); if(!item) return;
                 const d=el("details","rg-suggestion"); d.append(el("summary","",`建议草案：${item.title}`),el("p","",item.content));
                 const stale=item.based_on_revision!==s.data.workspace.revision;
-                const b=el("button","rg-small-btn",item.applied_item_id ? "已采纳" : stale ? "材料已更新，请重新讨论" : "采纳到研究记录"); b.disabled=!!item.applied_item_id || stale || s.busy;
+                const closed=["result","finding","outline"].includes(item.kind);
+                const b=el("button","rg-small-btn",closed ? "历史建议（仅查看）" : item.applied_item_id ? "已采纳" : stale ? "材料已更新，请重新讨论" : "采纳到研究记录"); b.disabled=closed || !!item.applied_item_id || stale || s.busy;
                 b.onclick=async()=>{const pid=s.pid; b.disabled=true; try{const data=await request(pid,`/suggestions/${id}/apply`,{expected_revision:s.data.workspace.revision}); if(pid===s.pid){s.data=data; renderMessages(); renderRecords(); window.dispatchEvent(new CustomEvent("sra:records-changed",{detail:{projectId:pid}}));}}catch(e){error(e.message);b.disabled=false;}}; d.append(b); card.append(d);
             });
             if(m.role==="assistant") {const b=el("button","rg-small-btn","存入灵感笔记"); b.onclick=()=>saveNote(m.content,b); card.append(b);}
@@ -140,7 +144,7 @@
         $("rg-input").focus();
     });
     $("rg-form").addEventListener("submit",async event=>{
-        event.preventDefault(); const text=$("rg-input").value.trim(); if(!text || !s.pid || !s.data || s.busy || s.data.research_scope?.supported===false) return;
+        event.preventDefault(); const text=$("rg-input").value.trim(); if(!text || !s.pid || !s.data || s.busy || area()==="writing" || s.data.research_scope?.supported===false) return;
         const pid=s.pid, chosenArea=area(), papers=s.papers.slice(), selected=s.selected, inputVersion=s.inputVersion;
         s.busy=true; error();renderContext();renderMessages(true);
         try {

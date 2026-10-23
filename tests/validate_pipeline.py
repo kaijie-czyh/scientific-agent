@@ -65,11 +65,12 @@ def check_main_pipeline() -> dict[str, Any]:
     _cfgmod._default_config = None
     from core.config import get_config
     from runtime.pipeline import Pipeline
+    from core.product_boundary import ExecutionPolicy
 
     cfg = get_config()
     cfg.dry_run = True
 
-    pipeline = Pipeline(config=cfg)
+    pipeline = Pipeline(config=cfg, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     project_id = f"validate_main_{int(os.getpid())}"
 
     try:
@@ -126,10 +127,11 @@ def check_discovery_pipeline() -> dict[str, Any]:
     _cfgmod._default_config = None
     from core.config import get_config
     from runtime.pipeline import Pipeline
+    from core.product_boundary import ExecutionPolicy
 
     cfg = get_config()
     cfg.dry_run = True
-    pipeline = Pipeline(config=cfg)
+    pipeline = Pipeline(config=cfg, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     project_id = f"validate_disc_{int(os.getpid())}"
 
     try:
@@ -170,10 +172,11 @@ def check_resume_recovery() -> dict[str, Any]:
     _cfgmod._default_config = None
     from core.config import get_config
     from runtime.pipeline import Pipeline
+    from core.product_boundary import ExecutionPolicy
 
     cfg = get_config()
     cfg.dry_run = True
-    pipeline = Pipeline(config=cfg)
+    pipeline = Pipeline(config=cfg, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     project_id = f"validate_resume_{int(os.getpid())}"
     topic = "热电材料性能优化测试"
 
@@ -224,11 +227,12 @@ def check_blocked_recovery() -> dict[str, Any]:
     _cfgmod._default_config = None
     from core.config import get_config
     from runtime.pipeline import Pipeline
+    from core.product_boundary import ExecutionPolicy
     from core.state.lifecycle import LifecycleStage, StageStatus
 
     cfg = get_config()
     cfg.dry_run = True
-    pipeline = Pipeline(config=cfg)
+    pipeline = Pipeline(config=cfg, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     project_id = f"validate_blocked_{int(os.getpid())}"
     topic = "blocked 测试主题"
 
@@ -284,10 +288,11 @@ def check_stage_propagation() -> dict[str, Any]:
     _cfgmod._default_config = None
     from core.config import get_config
     from runtime.pipeline import Pipeline
+    from core.product_boundary import ExecutionPolicy
 
     cfg = get_config()
     cfg.dry_run = True
-    pipeline = Pipeline(config=cfg)
+    pipeline = Pipeline(config=cfg, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     project_id = f"validate_prop_{int(os.getpid())}"
     topic = "热电材料构效关系传播验证"
 

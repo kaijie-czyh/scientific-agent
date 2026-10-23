@@ -16,6 +16,7 @@ from core.orchestration.node import HumanResponse, NodeStatus
 from core.state.lifecycle import LifecycleStage
 from core.workflow_checkpoint import KEY, restore_context, save_context
 from runtime.pipeline import Pipeline
+from core.product_boundary import ExecutionPolicy
 from stages.common import (
     ARTIFACT_MANAGER, DESIGN_CLAIM_IDS, DESIGN_METHOD_CONTENT, DRY_RUN, EXPERIMENT_IDS,
     EXPERIMENT_OUTCOME, KNOWLEDGE_STORE, LLM_REGISTRY, PROJECT_DIR, PROJECT_DOMAIN,
@@ -50,7 +51,8 @@ def setup_project(tmp_path, monkeypatch):
 
 
 def submit(api, items):
-    return api.backfill_experiment_results("p1", api.ExperimentBackfillRequest(results_json=json.dumps({"experiments":items})))
+    # Explicit legacy-domain fixture; the public backfill route is closed.
+    return api._backfill_experiment_results_internal("p1", api.ExperimentBackfillRequest(results_json=json.dumps({"experiments":items})))
 
 
 @pytest.mark.parametrize("change", [
@@ -221,7 +223,7 @@ def test_resume_wait_backfill_negative_results_and_complete_writing_without_repl
     api, config, _, store, _ = setup_project
     model = WorkflowModel()
     monkeypatch.setattr(LLMRegistry, "from_config", classmethod(lambda cls, config: model))
-    pipeline = Pipeline(config=config)
+    pipeline = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     session, ctx = pipeline.start_project("p1", "软件测试：联邦学习", "ai")
     for stage in (LifecycleStage.RESEARCH,LifecycleStage.IDEATION,LifecycleStage.DESIGN):
         session.start_stage(stage)
@@ -234,10 +236,10 @@ def test_resume_wait_backfill_negative_results_and_complete_writing_without_repl
     assert first.status == "experiment_pending", first.summary
     count_before = len(store.list_experiments())
     # 模拟刷新/重启，再点继续。仍等待，不能绕过结果门控进入写作。
-    still_waiting = Pipeline(config=config).run_pipeline("p1", "", resume=True, human_callback=approve)
+    still_waiting = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "", resume=True, human_callback=approve)
     assert still_waiting.status == "experiment_pending"
     submit(api,[{"name":"trial","status":"success","metrics":{"accuracy":0.61},"claim_assessments":{"c1":"refutes"}}])
-    completed = Pipeline(config=config).run_pipeline("p1", "", resume=True, human_callback=approve)
+    completed = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "", resume=True, human_callback=approve)
     assert completed.status == "completed", completed.summary
     assert len(store.list_experiments()) == count_before
     assert sum(c.get("output_schema",type(None)).__name__ == "ExperimentConfigSchema" for c in model.calls) == 1
@@ -261,7 +263,7 @@ def test_all_five_stages_with_offline_search_model_then_resume_to_saved_manuscri
     monkeypatch.setattr(PaperFetchAgent,"_real_fetch",lambda self, data, *args, **kwargs:([dict(meta)],[]))
     monkeypatch.setattr(PaperIngestAgent,"_enrich_urls",staticmethod(lambda metas:None))
     approve = lambda request: HumanResponse(action="continue",text="ok")
-    first = Pipeline(config=config).run_pipeline("p1","联邦学习（离线软件测试）",human_callback=approve,domain="ai")
+    first = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1","联邦学习（离线软件测试）",human_callback=approve,domain="ai")
     assert first.status == "experiment_pending", first.summary
     assert len(first.completed_stages) == 4
     assert store.list_ideas()
@@ -269,7 +271,7 @@ def test_all_five_stages_with_offline_search_model_then_resume_to_saved_manuscri
     plan_path = config.paths.project_dir("p1") / "experiments/experiment_plan.json"
     before = plan_path.read_text(encoding="utf-8")
     submit(api,[{"name":"trial","status":"success","metrics":{"accuracy":0.61},"claim_assessments":{cid:"refutes" for cid in model.claim_ids}}])
-    final = Pipeline(config=config).run_pipeline("p1","",resume=True,human_callback=approve)
+    final = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1","",resume=True,human_callback=approve)
     assert final.status == "completed", final.summary
     assert len(final.completed_stages) == 5
     assert plan_path.read_text(encoding="utf-8") == before
@@ -287,7 +289,7 @@ def test_restart_at_method_confirmation_does_not_regenerate_paid_steps(setup_pro
     model = WorkflowModel()
     model.store = store
     monkeypatch.setattr(LLMRegistry,"from_config",classmethod(lambda cls, config:model))
-    pipeline = Pipeline(config=config)
+    pipeline = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     session,ctx = pipeline.start_project("p1","联邦学习软件测试","ai")
     for stage in (LifecycleStage.RESEARCH,LifecycleStage.IDEATION):
         session.start_stage(stage)
@@ -297,7 +299,7 @@ def test_restart_at_method_confirmation_does_not_regenerate_paid_steps(setup_pro
     assert first.status == "pending_human"
     count_before = len([c for c in model.calls if c.get("task_type") == "design_method_formalize"])
     assert count_before == 1
-    resumed = Pipeline(config=config).run_pipeline("p1","",resume=True,human_callback=lambda req:HumanResponse(action="continue",text="ok"))
+    resumed = Pipeline(config=config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1","",resume=True,human_callback=lambda req:HumanResponse(action="continue",text="ok"))
     assert resumed.status == "experiment_pending", resumed.summary
     assert len([c for c in model.calls if c.get("task_type") == "design_method_formalize"]) == count_before
 

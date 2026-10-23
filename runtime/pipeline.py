@@ -41,6 +41,7 @@ from core.orchestration.graph import Graph, GraphRunner
 from core.orchestration.node import HumanRequest, HumanResponse, NodeResult, NodeStatus
 from core.state.lifecycle import LifecycleStage, StageStatus
 from core.state.session import ProjectSession
+from core.product_boundary import ExecutionPolicy, ProductExecutionRestricted, inspect_boundary, public_boundary, NOTICE
 from core.workflow_checkpoint import restore_context, save_context
 
 from stages.common import (
@@ -89,7 +90,7 @@ class StageResult:
     """单阶段执行结果。"""
 
     stage: LifecycleStage
-    status: str  # success / pending_human / failed / aborted / experiment_failed / experiment_pending
+    status: str  # success / pending_human / failed / aborted / restricted
     summary: str = ""
     node_history: list[dict] = field(default_factory=list)
     # 若 status=pending_human，附带当前人工请求
@@ -98,6 +99,10 @@ class StageResult:
     experiment_outcome: Optional[dict] = None
     # 建议的下一步动作
     recommendation: str = ""
+    product_boundary: Optional[dict] = None  # status=restricted never counts as success
+
+    def __post_init__(self):
+        self.stage = LifecycleStage(self.stage)
 
 
 @dataclass
@@ -105,7 +110,7 @@ class PipelineResult:
     """全流程执行结果。"""
 
     project_id: str
-    status: str  # completed / pending_human / failed / aborted / experiment_failed / experiment_pending / stopped
+    status: str  # completed / pending_human / failed / aborted / stopped / restricted (legacy: experiment_*)
     completed_stages: list[LifecycleStage] = field(default_factory=list)
     current_stage: Optional[LifecycleStage] = None
     summary: str = ""
@@ -114,17 +119,27 @@ class PipelineResult:
     node_history: list[dict] = field(default_factory=list)
     # 额外的上下文数据（如方向推荐的推荐列表、趋势数据等）
     extra: dict = field(default_factory=dict)
+    product_boundary: Optional[dict] = None
 
 
 class Pipeline:
-    """端到端科研论文生成 Pipeline。
+    """默认止于 DESIGN 的研究方案流水线。
 
-    串联 5 个生命周期阶段，处理状态流转、依赖注入、实验成败判断、人工节点。
+    旧五阶段编排仅供显式 INTERNAL_LEGACY 架构夹具使用。
     """
 
-    def __init__(self, config: Optional[GlobalConfig] = None):
+    def __init__(self, config: Optional[GlobalConfig] = None, *, execution_policy: ExecutionPolicy = ExecutionPolicy.PRODUCT_PLAN):
+        if not isinstance(execution_policy, ExecutionPolicy):
+            raise TypeError("execution_policy must be an explicit ExecutionPolicy enum")
         self.config = config or get_config()
         self.paths = self.config.paths
+        self.execution_policy = execution_policy
+
+    def _preflight(self, project_id, **kwargs):
+        boundary = inspect_boundary(self.paths, project_id, **kwargs)
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN and boundary["restricted"]:
+            raise ProductExecutionRestricted(boundary)
+        return boundary
 
     # ===== 项目初始化 =====
 
@@ -146,6 +161,9 @@ class Pipeline:
         Returns:
             (session, ctx) — 项目会话与执行上下文
         """
+        boundary = self._preflight(project_id)
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN and boundary["reason"] == "design_generated":
+            raise ProductExecutionRestricted({**boundary, "message": "已有方法方案已保留，请使用独立的方案修订入口；不能重新初始化历史流程。"})
         # 创建项目会话
         session = ProjectSession.create(project_id, self.paths)
 
@@ -194,6 +212,9 @@ class Pipeline:
                    否则恢复后 RESEARCH_TOPIC 为空，检索阶段会拿到空主题。
             domain: 研究领域。留空时从 KV 恢复上次保存的领域。
         """
+        boundary = self._preflight(project_id)
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN and boundary["reason"] == "design_generated":
+            raise ProductExecutionRestricted({**boundary, "message": "已有方法方案已保留，请审阅或独立修订，不恢复后续流水线。"})
         session = ProjectSession.load(project_id, self.paths)
         ctx = ExecutionContext(project_id=project_id)
         # 重新注入依赖（依赖不持久化在 context 里，每次恢复时重建）
@@ -486,6 +507,16 @@ class Pipeline:
         Returns:
             StageResult
         """
+        stage = LifecycleStage(stage)
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+            try:
+                boundary = self._preflight(ctx.project_id, session=session, ctx=ctx)
+                if boundary["reason"] == "design_generated":
+                    raise ProductExecutionRestricted({**boundary, "message": "方案阶段已经结束；请使用独立的方法修订入口，不重跑历史阶段。"})
+                if stage.index() > LifecycleStage.DESIGN.index():
+                    raise ProductExecutionRestricted({"max_stage":"design","restricted":True,"reason":"stage_not_supported","message":NOTICE})
+            except ProductExecutionRestricted as exc:
+                return StageResult(stage=stage, status="restricted", summary=str(exc), node_history=ctx.history(), product_boundary=exc.boundary)
         graph = self._build_stage_graph(stage)
         def recorded(history):
             store = ctx.get(KNOWLEDGE_STORE)
@@ -539,6 +570,11 @@ class Pipeline:
             # 有回调，调用回调获取响应
             req = runner.pending_human_request()
             resp = human_callback(req)
+            if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+                try:
+                    self._preflight(ctx.project_id, session=session, ctx=ctx)
+                except ProductExecutionRestricted as exc:
+                    return StageResult(stage=stage,status="restricted",summary=str(exc),node_history=ctx.history(),product_boundary=exc.boundary)
             runner.resume_after_human(resp)
 
         # 检查执行结果
@@ -619,8 +655,21 @@ class Pipeline:
         Returns:
             PipelineResult
         """
+        if force_writing and self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+            raise ValueError("force_writing 不能绕过当前产品的研究方案阶段上限")
         if force_writing and not self.config.dry_run:
             raise ValueError("真实模式不能通过 force_writing 绕过结果审核；可先保存写作骨架或回填真实结果")
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+            try:
+                boundary = self._preflight(project_id)
+            except ProductExecutionRestricted as exc:
+                return PipelineResult(project_id=project_id,status="restricted",summary=str(exc),product_boundary=exc.boundary)
+            if boundary["stage_statuses"].get("design")=="done":
+                return PipelineResult(project_id=project_id,status="stopped",current_stage=LifecycleStage.DESIGN,
+                    completed_stages=[s for s in LifecycleStage.ordered() if s.index()<=LifecycleStage.DESIGN.index() and boundary["stage_statuses"].get(s.value)=="done"],
+                    summary="已有方法方案已保留，请核对关联问题后审阅、修改或导出；不启动实验。",node_history=boundary["history"],product_boundary=public_boundary(boundary))
+            if stop_before is None or stop_before.index()>LifecycleStage.EXPERIMENT.index():
+                stop_before = LifecycleStage.EXPERIMENT
         # 初始化或恢复
         if resume:
             session, ctx = self.resume_project(project_id, topic, domain)
@@ -712,6 +761,12 @@ class Pipeline:
             result.current_stage = stage
             result.node_history = stage_result.node_history
 
+            if stage_result.status == "restricted":
+                result.status = "restricted"
+                result.summary = stage_result.summary
+                result.product_boundary = stage_result.product_boundary
+                return result
+
             if stage_result.status == "pending_human":
                 result.status = "pending_human"
                 result.summary = stage_result.summary
@@ -728,8 +783,18 @@ class Pipeline:
                 result.summary = stage_result.summary
                 return result
 
+            if stage_result.status != "success":
+                result.status = "failed"
+                result.summary = f"未知或未完成的阶段返回：{stage_result.status}；未计作成功"
+                return result
             # 阶段成功
             result.completed_stages.append(stage)
+            if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN and stage == LifecycleStage.DESIGN:
+                result.status="stopped"
+                result.summary="方法方案已生成并经过本阶段审核；请核对当前问题及关联方案，再审阅、修改或导出。未进入实验和写作。"
+                result.recommendation="review_plan"
+                result.product_boundary={"max_stage":"design","restricted":False,"reason":"design_generated","message":result.summary}
+                return result
 
             # ===== 关键：experiment 后判断是否进入 writing =====
             if stage == LifecycleStage.EXPERIMENT:
@@ -808,6 +873,9 @@ class Pipeline:
         Returns:
             PipelineResult，summary 含发现概览，node_history 含 discovery 节点历史
         """
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+            return PipelineResult(project_id=project_id,status="restricted",summary="关系发现扩展不属于本轮研究方案流程；历史报告仍可查看、导出。",
+                product_boundary={"max_stage":"design","restricted":True,"reason":"unsupported_subflow"})
         if resume:
             session, ctx = self.resume_project(project_id, topic)
         else:
@@ -827,8 +895,9 @@ class Pipeline:
                 result.status = "pending_human"
                 result.summary = research_result.summary
                 return result
-            if research_result.status in ("failed", "aborted"):
-                result.status = research_result.status
+            if research_result.status != "success":
+                result.status = research_result.status if research_result.status in ("failed", "aborted", "restricted") else "failed"
+                result.product_boundary = research_result.product_boundary
                 result.summary = f"research 阶段{research_result.status}: {research_result.summary}"
                 return result
             result.completed_stages.append(LifecycleStage.RESEARCH)
@@ -939,6 +1008,13 @@ class Pipeline:
         Returns:
             PipelineResult，summary 含推荐与选择概览
         """
+        try:
+            boundary = self._preflight(project_id)
+        except ProductExecutionRestricted as exc:
+            return PipelineResult(project_id=project_id,status="restricted",summary=str(exc),product_boundary=exc.boundary)
+        if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN and boundary["reason"] == "design_generated":
+            return PipelineResult(project_id=project_id, status="stopped", current_stage=LifecycleStage.DESIGN,
+                summary="已有方案已保留，请审阅、修改或导出，不重新启动选题。", product_boundary=public_boundary(boundary))
         if resume:
             session, ctx = self.resume_project(project_id, interest, domain)
         else:
@@ -1003,6 +1079,11 @@ class Pipeline:
                 return result
             req = runner.pending_human_request()
             resp = human_callback(req)
+            if self.execution_policy is ExecutionPolicy.PRODUCT_PLAN:
+                try:
+                    self._preflight(project_id, session=session, ctx=ctx)
+                except ProductExecutionRestricted as exc:
+                    return PipelineResult(project_id=project_id, status="restricted", summary=str(exc), product_boundary=exc.boundary)
             runner.resume_after_human(resp)
 
         if runner.is_aborted():
@@ -1052,8 +1133,9 @@ class Pipeline:
                 result.status = "pending_human"
                 result.summary = f"方向推荐完成 → research 阶段等待人工输入"
                 return result
-            if research_result.status in ("failed", "aborted"):
-                result.status = research_result.status
+            if research_result.status != "success":
+                result.status = research_result.status if research_result.status in ("failed", "aborted", "restricted") else "failed"
+                result.product_boundary = research_result.product_boundary
                 result.summary = f"research 阶段{research_result.status}: {research_result.summary}"
                 return result
             result.completed_stages.append(LifecycleStage.RESEARCH)

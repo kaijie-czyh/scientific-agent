@@ -54,7 +54,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 
 上面是仓库现有 `deepseek` 路由对应的配置格式；如果使用兼容网关，必须填该网关给出的地址和密钥，不能混用不同服务商的凭据。
 
-同时打开 `config/tasks.yaml`，核对各任务的 `provider` 与 `model`。当前主流程多数任务配置为 `deepseek / deepseek-v4.1-flash`，**这是仓库配置值，不是对服务商当前支持情况的保证**。请改为你实际账号支持的模型标识；不要仅凭复制默认配置就认为模型可用，也不要依据文件顶部的旧注释判断当前路由。
+同时打开 `config/tasks.yaml`，核对各任务的 `provider` 与 `model`。当前生成任务配置为 `deepseek / deepseek-v4.1-flash-1017`，**这是本地路由标识，不是对官方 API 或任意网关可用性的保证**。示例地址不能保证支持这个标识，请配置你实际服务的地址、密钥和可用模型；不要仅凭复制默认配置就认为模型可用，也不要依据文件顶部的旧注释判断当前路由。
 
 单个任务的配置形式如下，**不要用这个片段覆盖整个文件**：
 
@@ -66,7 +66,7 @@ tasks:
     temperature: 0.2
 ```
 
-切换模型时，应检查选题、科研指导、方法与写作等相关任务，而不只改一个任务。切换厂商时，还要填写对应凭据并修改 `provider`；具体支持的配置可查看 `.env.example` 与 `core/llm/registry.py`。
+切换模型时，应检查科研指导、检索规划／整理和方案等相关任务，而不只改一个任务。旧内部阶段的路由保留不代表网页开放实验或写作。切换厂商时，还要填写对应凭据并修改 `provider`；具体支持的配置可查看 `.env.example` 与 `core/llm/registry.py`。
 
 | 配置 | 是否必需 | 用途 |
 | --- | --- | --- |
@@ -123,7 +123,7 @@ https://github.com/weimeng09280929/scientific-agent
    以及尚未验证的事项。不要把本地开发服务直接暴露到公网。
 ```
 
-安装完成后，研究问题、方案选择、实验执行与结论确认仍需你参与。编程助手完成环境搭建，不等于科研 Agent 已经替你完成研究。
+安装完成后，研究问题与方案的选择、来源核对和正式采纳仍需你参与。编程助手完成环境搭建，不等于科研 Agent 已经替你完成研究。本版止于方案，不执行实验或论文生成。
 
 ### 数据保存、更新与服务器运行
 
@@ -145,7 +145,7 @@ https://github.com/weimeng09280929/scientific-agent
 
 ```bash
 python -m pip install pytest pytest-asyncio httpx
-python -m pytest tests/test_workflow_reliability.py tests/test_research_workspace.py tests/test_direction_evidence.py -q
+python -m pytest tests/test_product_plan_boundary.py tests/test_project_conversations.py tests/test_library_audit_refresh.py -q
 ```
 
 这些测试不等同于真实模型、外部检索和整条科研流程的端到端验收。

@@ -12,6 +12,7 @@ from core.orchestration.node import HumanResponse, NodeResult, NodeStatus
 from core.state.lifecycle import LifecycleStage
 from core.workflow_checkpoint import KEY
 from runtime.pipeline import Pipeline
+from core.product_boundary import ExecutionPolicy
 from stages.common import StageCheckpoint
 from tests.test_orchestration_graph import _NoopAgent
 from tests.test_workflow_reliability import setup_project, WorkflowModel, submit
@@ -37,14 +38,14 @@ def test_restart_at_each_stage_then_finish_without_repeating_completed_work(setu
         return approve(request)
 
     if target == "revise":
-        first = Pipeline(config).run_pipeline("p1", "联邦学习离线恢复测试", human_callback=approve, domain="ai")
+        first = Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "联邦学习离线恢复测试", human_callback=approve, domain="ai")
         assert first.status == "experiment_pending"
         submit(api, [{"name": "trial", "status": "completed", "metrics": {"accuracy": .61}, "claim_assessments": {c: "inconclusive" for c in model.claim_ids}}])
         with pytest.raises(RuntimeError, match="进程"):
-            Pipeline(config).run_pipeline("p1", "", resume=True, human_callback=interrupt)
+            Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "", resume=True, human_callback=interrupt)
     else:
         with pytest.raises(RuntimeError, match="进程"):
-            Pipeline(config).run_pipeline("p1", "联邦学习离线恢复测试", human_callback=interrupt, domain="ai")
+            Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "联邦学习离线恢复测试", human_callback=interrupt, domain="ai")
     saved = store.get_kv(KEY)
     assert saved["history"][-1]["node_id"] == target
     key = lambda c: (c.get("task_type"), getattr(c.get("output_schema"), "__name__", "text"))
@@ -52,7 +53,7 @@ def test_restart_at_each_stage_then_finish_without_repeating_completed_work(setu
     node_count_before = len(saved["history"])
     if changed:
         submit(api, [{"name":"trial", "status":"completed", "metrics":{"accuracy":.61,"additional_measure":1}, "claim_assessments":{c:"inconclusive" for c in model.claim_ids}}])
-    restored = Pipeline(config).run_pipeline("p1", "", resume=True, human_callback=approve)
+    restored = Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "", resume=True, human_callback=approve)
     # Only new work may call the model; earlier generation tasks are not repeated.
     after = Counter(key(c) for c in model.calls)
     excluded = {"experiment_anomaly_analyze", "experiment_outcome_assess"}
@@ -65,7 +66,7 @@ def test_restart_at_each_stage_then_finish_without_repeating_completed_work(setu
             assert after[task] == before[task], task
     if restored.status == "experiment_pending":
         submit(api, [{"name": "trial", "status": "completed", "metrics": {"accuracy": .61}, "claim_assessments": {c: "refutes" for c in model.claim_ids}}])
-        restored = Pipeline(config).run_pipeline("p1", "", resume=True, human_callback=approve)
+        restored = Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY).run_pipeline("p1", "", resume=True, human_callback=approve)
     assert restored.status == "completed", restored.summary
     assert len(store.list_experiments()) == 2  # seeded baseline + one generated task
     assert store.list_artifacts(ArtifactType.PAPER_DRAFT)
@@ -87,7 +88,7 @@ def test_failed_node_preserves_history_and_retries_only_failed_node(setup_projec
         graph.add_node(node)
     graph.add_edge("earlier", "checkpoint")
     graph.add_edge("checkpoint", "later")
-    pipeline = Pipeline(config)
+    pipeline = Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     monkeypatch.setattr(pipeline, "_build_stage_graph", lambda stage: graph)
     session, ctx = pipeline.start_project("p1", "故障恢复软件测试", "ai")
     first = pipeline.run_stage(session, ctx, LifecycleStage.RESEARCH)
@@ -124,18 +125,20 @@ def test_completed_project_opens_outputs_and_flags_results_changed_after_final_s
     api, _, state, _, _ = setup_project
     state.status = "completed"
     monkeypatch.setattr(api, "run_project", lambda *args: pytest.fail("已完成项目不能重跑"))
-    assert api.resume_project_task("p1")["action"] == "complete"
+    assert api.resume_project_task("p1")["action"] == "materials"
     submit(api, [{"name":"baseline", "status":"completed", "metrics":{"accuracy":.61}}])
     assert "原稿件保留" in state.summary
-    assert "结果有更新" in api.resume_project_task("p1")["hint"]
+    assert api.resume_project_task("p1")["action"] == "materials"
+    assert state.thread is None
 
 
 def test_waiting_results_then_review_action_changes_after_backfill(setup_project):
     api, _, state, store, ctx = setup_project
     state.status = "experiment_pending"
-    assert api.resume_project_task("p1")["action"] == "results"
+    assert api.resume_project_task("p1")["action"] == "view_only"
     submit(api, [{"name": "baseline", "status": "completed", "metrics": {"accuracy": .61}}])
-    assert api.get_status("p1")["continuation"]["label"] == "复核结果并继续"
+    assert api.get_status("p1")["continuation"]["action"] == "view_only"
+    assert store.get_experiment("e1").metrics=={"accuracy":.61}
 
 
 def test_written_artifacts_are_counted_without_duplicate_versions(setup_project):
@@ -152,7 +155,8 @@ def test_resume_ignores_unrelated_old_planned_experiments(setup_project):
     store.save_experiment(Experiment(experiment_id="active", name="当前任务", status=ExperimentStatus.COMPLETED, metrics={"accuracy": .61}))
     store.save_kv(KEY, {"data": {"experiment.experiment_ids": ["active"]}})
     state.status = "experiment_pending"
-    assert api.get_status("p1")["continuation"]["action"] == "resume"
+    assert api.get_status("p1")["continuation"]["action"] == "view_only"
+    assert store.get_experiment("active").metrics=={"accuracy":.61}
 
 
 def test_topic_discovery_handoff_tracks_the_new_worker(setup_project, monkeypatch):
@@ -187,7 +191,7 @@ def test_discovery_resume_advances_past_saved_success_instead_of_regenerating(se
     graph.add_node(_NoopHuman("select", prompt="测试确认"))
     graph.add_edge("generate", "select")
     monkeypatch.setattr(discovery, "build_topic_discovery_graph", lambda: graph)
-    pipeline = Pipeline(config)
+    pipeline = Pipeline(config, execution_policy=ExecutionPolicy.INTERNAL_LEGACY)
     _, ctx = pipeline.start_project("p1", "测试兴趣", "ai")
     ctx.current_stage = "topic_discovery"
     ctx.current_node_id = "generate"

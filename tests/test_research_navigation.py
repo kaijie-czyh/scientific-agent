@@ -22,13 +22,21 @@ def test_navigation_labels_and_aliases_share_one_definition():
     data = navigation()
     html = (ROOT / "web/static/index.html").read_text(encoding="utf-8")
     items = re.findall(r'class="nav-item" data-page="([^"]+)">\s*<span>([^<]+)</span>', html)
-    assert [key for key, _ in items] == ["dashboard", "create", "topic-discovery", "papers", "research-report", "gaps", "experiments", "writing", "progress", "notes", "human", "methods"]
+    assert [key for key, _ in items] == ["papers", "experiments", "notes", "human", "methods", "progress", "topic-discovery", "research-report", "gaps", "writing"]
+    # Dashboard/project access moved into separated conversation/project groups,
+    # while page identities, deep links and keyboard shortcuts stay available.
+    assert 'aria-label="最近对话"' in html and 'aria-label="项目"' in html
+    assert 'id="ch-project-manage"' in html and 'id="ch-new"' in html
     assert all(data["pages"][key]["title"] == text for key, text in items)
     assert data["pages"]["claims"]["owner"] == "gaps"
     assert data["pages"]["reading-method"]["owner"] == "methods"
     assert data["pages"]["writing-method"]["area"] == "writing"
-    assert all(target in dict(items) for target in data["shortcuts"].values())
+    assert all(target in set(dict(items)) | {"dashboard", "create"} for target in data["shortcuts"].values())
     assert html.index('src="/static/research-navigation.js"') < html.index('src="/static/research-guide.js"') < html.index('src="/static/app.js"')
+    assert html.index('src="/static/conversation-home.js"') < html.index('src="/static/research-guide.js"')
+    assert 'id="ch-new"' in html and '<summary>更多</summary>' in html
+    assert data["pages"]["dashboard"]["title"]=="科研对话"
+    assert data["pages"]["writing"]["title"]=="历史材料"
 
 
 def test_materials_only_returns_latest_saved_artifacts_without_model_calls(tmp_path):
