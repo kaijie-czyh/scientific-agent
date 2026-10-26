@@ -495,6 +495,29 @@
         }catch(e){fail(v,e);if(e.status===409)await refreshMaterials(v).catch(()=>{});}
         finally{v.adopting=false;paintMaterials(v);}
     }
+    function planQuality(v,item,draft,review){
+        const box=E('section','ch-plan-quality');box.setAttribute('aria-label','方案交付检查');
+        let loading=false,loaded=false;
+        const load=async()=>{
+            if(loading || loaded || !current(v) || !box.isConnected)return;
+            loading=true;box.replaceChildren(E('p','muted','正在核对引用和研究条件…'));
+            const params=new URLSearchParams(draft ? {conversation_id:v.cid,suggestion_id:item.suggestion_id} : {item_id:item.item_id});
+            try{
+                const report=await request(`/api/projects/${encodeURIComponent(v.pid)}/workspace/plan-quality?${params}`,{signal:v.reads.signal});
+                if(!current(v) || !box.isConnected)return;
+                loaded=true;box.dataset.qualityStatus=report.status;
+                box.replaceChildren(E('h4','','交付检查'),E('strong','',report.label));
+                const checks=E('ul');for(const check of report.checks){const row=E('li','',`${check.label}：${check.detail}`);row.dataset.check=check.code;checks.append(row);}box.append(checks);
+                if(report.evidence.length){const sources=E('details');sources.append(E('summary','','逐条核对引用片段'));
+                    for(const entry of report.evidence){const row=E('section','ch-quality-citation');row.append(E('p','',entry.statement),button(entry.title,()=>openMaterial(v,'papers',entry.paper_id),'ch-text-button'),E('p','muted small',entry.location),E('blockquote','',entry.quote || '尚未提供引用片段'));sources.append(row);}box.append(sources);}
+                const questions=E('details');questions.append(E('summary','','研究者审阅要点'));for(const text of report.review_questions)questions.append(E('p','',text));box.append(questions,E('p','muted small',report.notice));
+                if(!v.material?.teaching && report.status==='needs_attention')box.append(button('讨论待补充项',()=>{panel(v,false);preparePlanInput(v,`请和我核对方案“${item.title}”的待补充项：${report.checks.filter(c=>c.status==='attention').map(c=>c.detail.replace(/[。；]+$/,'')).join('；')}。先讨论，不自动采纳或重写方案。`,null);}));
+            }catch(e){if(current(v) && box.isConnected){box.replaceChildren(E('p','ch-warning','交付检查暂不可用，请重试；原方案仍保留。'),button('重新检查',load));}}
+            finally{loading=false;}
+        };
+        review.addEventListener('toggle',()=>{if(review.open)load();});
+        return box;
+    }
     function planReview(v,item,draft){
         if(draft && item.applied_item_id){const saved=v.material?.workspace.items.find(i=>i.item_id===item.applied_item_id);if(saved)return planReview(v,saved,false);}
         const names={computational:"计算研究",theoretical:"理论研究",experimental:"实验研究设计"},box=E("details","ch-plan-review");box.dataset.planId=item.item_id || item.suggestion_id;
@@ -516,7 +539,7 @@
             const pending="## 待讨论事项\n\n"+item.plan.unconfirmed.map(s=>"- "+s).join("\n\n");
             if(item.plan.unconfirmed.length)body=body.replace(pending,"");
         }
-        box.append(E("p","muted small",v.material?.teaching ? "教学方案 · 预置资料，未执行。结构与依据检查仅供讨论。" : "结构与依据检查仅供讨论；方案尚未执行，结论未验证。"),rich(visibleContent(v,body)));
+        box.append(E("p","muted small",v.material?.teaching ? "教学方案 · 预置资料，未执行。结构与依据检查仅供讨论。" : "结构与依据检查仅供讨论；方案尚未执行，结论未验证。"),planQuality(v,item,draft,box),rich(visibleContent(v,body)));
         if(item.plan?.unconfirmed.length)box.append(E("p","ch-warning","待确认／待讨论："+item.plan.unconfirmed.join("；")));
         const metadata=E("details","ch-plan-metadata");metadata.append(E("summary","","版本与技术详情"),E("p","muted small",`模板：${item.plan?.template_version || '旧结构'}；记录：${item.item_id || item.suggestion_id}；问题记录：${q?.item_id || '需核对'}；修订记录：${item.supersedes_id || '无'}`));box.append(metadata);
         const controls=E("div","ch-plan-controls");

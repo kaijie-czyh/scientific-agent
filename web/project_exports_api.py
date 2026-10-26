@@ -450,6 +450,11 @@ def build_exports_router(
             text += "\n\n参考来源：" + (
                 f"{p.title} ({pid})；DOI：{p.doi or '无'}" if p else pid
             )
+        from core.workspace.plan_quality import render_quality
+
+        service = read(state.project_id)[2]
+        quality = service.plan_quality(item, needs_review=getattr(item, "needs_review", False))
+        text += "\n\n" + render_quality(quality)
         return text
 
     def service_papers(pid):
@@ -497,6 +502,7 @@ def build_exports_router(
             }
         )
         item = WorkItem(**data.model_dump())
+        item.needs_review = bool(s.get("basis_changed", True))
         w = service.load(include_chat=False)
         status = (
             "已采纳的原始草案（请在正式记录查看版本）"

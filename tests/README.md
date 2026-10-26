@@ -19,6 +19,7 @@ python -m pytest tests/test_product_plan_boundary.py tests/test_project_conversa
 | 多会话、幂等与材料依据 | test_project_conversations.py、test_second_batch_workspace.py |
 | 检索来源、报告范围与调用审计 | test_research_tasks.py、test_real_workflow_reliability.py |
 | 三类方案与修订 | test_research_plan_templates.py |
+| 交付检查、引用位置、只读与导出一致性 | test_plan_delivery_quality.py |
 | 离线教学与进度 | test_research_teaching_cases.py、test_teaching_experience.py |
 | 文献计数与检索审计展示 | test_navigation_counts.py、test_library_audit_refresh.py |
 
@@ -38,3 +39,9 @@ python tests/real_workflow_test_server.py --port 8069
 结束后关闭隔离实例；不要让脚本指向真实用户项目。其他脚本的端口与输出目录见各自环境变量及文件头。
 
 离线测试与浏览器检查不代表真实模型回答质量、科学正确性或公网发布验收。未经授权不要运行带 live 名称的脚本或真实服务调用。
+
+## 方案交付检查接口
+
+`GET /api/projects/{project_id}/workspace/plan-quality` 返回版本为 `1` 的结构化检查结果。指定 `item_id` 检查项目内的正式或历史方案；指定 `conversation_id` 和 `suggestion_id` 检查该会话的方案草案。两种目标不能混用，其他项目或会话的目标返回 404。
+
+返回结构包含 `target_id`、`workspace_revision`、`status`、`checks`、`evidence`、`pending_conditions` 和 `review_questions`。`status` 为 `legacy`、`needs_attention` 或 `ready_for_discussion`，均不表示科学验证通过。`evidence.matched` 仅指原引文在当前摘要或已存正文片段中匹配且列入参考来源；`location` 和可空的 `page` 来自实际材料。读取不调用模型、不迁移数据库、不改写方案；修订和采纳仍使用原接口的版本及依据检查。

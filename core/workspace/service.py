@@ -506,6 +506,25 @@ class WorkspaceService:
         conversations.apply(conversations.legacy_id, suggestion_id, expected_revision)
         return self.load()
 
+    def plan_quality(self, item, *, needs_review=False):
+        """Assess an already project-scoped record/draft without changing it."""
+        from core.workspace.plan_quality import assess_plan
+        from core.workspace.plan_schema import ResearchPlan
+
+        data = item if isinstance(item, dict) else item.model_dump(mode="json")
+        plan = ResearchPlan.model_validate(data["plan"]) if data.get("plan") else None
+        workspace = self.load(include_chat=False)
+        stale = needs_review or data.get("needs_review", False) or data.get("status", "active") != "active"
+        if plan:
+            question = next((i for i in workspace.items if i.item_id == plan.question_id and i.kind == "question"), None)
+            stale = stale or not question or question.needs_review or question.status != "active" or question.item_id not in data.get("related_ids", [])
+        papers = {p.paper_id: p for p in self.store.list_papers()}
+        cited = {pid for section in plan.sections for st in section.statements for pid in st.paper_ids} if plan else set()
+        chunks = {pid: self.store.get_paper_chunks(pid) for pid in cited if pid in papers}
+        return assess_plan(plan, papers, chunks,
+                           target_id=data.get("item_id") or data["suggestion_id"],
+                           workspace_revision=workspace.revision, needs_review=bool(stale))
+
     def paper_summaries(self) -> list[dict]:
         return [
             {
