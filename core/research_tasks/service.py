@@ -23,6 +23,10 @@ import threading
 from contextvars import copy_context
 from uuid import uuid4
 from core.invocation_audit import read_audit
+from core.llm.public_errors import (
+    public_error, stored_note, stored_error,
+    SYNTHESIS_FAILURE, SOURCE_FAILURE, RESUME_FAILURE,
+)
 
 from pydantic import Field
 
@@ -263,8 +267,9 @@ class ResearchTaskService:
     def _effective(self, row):
         status = row["status"]
         # running 必然在持锁后设置：锁已释放而状态仍 running => 执行者已丢失。
-        # queued 不探测：刚登记的任务可能尚未被 runner 领取，不能误报中断。
-        if status == "running" and not task_lock_held(self.db_path):
+        # A live process owns its queued handoff before the worker takes the lock.
+        abandoned_queue = status == "queued" and row["owner_process"] != self.PROCESS_IDENTITY
+        if (status == "running" or abandoned_queue) and not task_lock_held(self.db_path):
             return "interrupted"
         return status
 
@@ -305,9 +310,9 @@ class ResearchTaskService:
             "year_to": row["year_to"],
             "year_label": self._year_label(row),
             "planned_by": row["planned_by"],
-            "planning_note": row["planning_note"] or "",
-            "ranking_note": row["ranking_note"] or "",
-            "synthesis_note": row["synthesis_note"] or "",
+            "planning_note": stored_note(row["planning_note"], "planning"),
+            "ranking_note": stored_note(row["ranking_note"], "ranking"),
+            "synthesis_note": stored_note(row["synthesis_note"], "synthesis"),
             "queries": queries,
             "source_calls": calls,
             "call_audit": read_audit(self.db_path,self.project_id,operation_id=row["task_id"]),
@@ -325,7 +330,7 @@ class ResearchTaskService:
             "saved_paper_ids": saved,
             "basis_changed": bool(row["basis_changed"]),
             "mode": row["mode"],
-            "error": row["error"],
+            "error": stored_error(row["error"]),
             "card_message_id": row["card_message_id"],
             "report_versions": [
                 {"version": v.get("version"), "status": v.get("status"),
@@ -511,8 +516,18 @@ class ResearchTaskService:
                 ),
             )
         row = self._read(task_id)
-        self._runner(lambda: self._execute(task_id, attempt=1))
+        self._schedule(task_id, attempt=1)
         return self.view(row)
+
+    def _schedule(self, task_id, attempt):
+        try:
+            self._runner(lambda: self._execute(task_id, attempt=attempt))
+        except Exception as exc:
+            logger.error("检索任务 %s 后台启动失败：%s", task_id, public_error(exc))
+            row = self._read(task_id)
+            if row["status"] == "queued" and row["attempts"] == attempt:
+                self._update(task_id, status="failed", error=public_error(exc), error_code=503, finished_at=now())
+            raise TaskError("后台检索未能启动，原请求与已有材料已保留；请查看任务状态后明确重试") from exc
 
     def _require_real_conversation(self, cid):
         """只允许在真实会话中发起检索；legacy 历史会话不做表迁移。"""
@@ -597,7 +612,7 @@ class ResearchTaskService:
                 with AuditScope(self.db_path,self.project_id,task_id,conversation_id=row["conversation_id"],request_id=row["request_id"],task_id=task_id).activate():
                     self._run_pipeline(task_id, row, payload, token, attempt)
         except Exception as exc:  # 执行线程的最后防线：任务必须落到明确状态
-            logger.exception("检索任务 %s 执行失败", task_id)
+            logger.error("检索任务 %s 执行失败：%s", task_id, public_error(exc))
             try:
                 row = self._read(task_id)
                 if row["status"] in ACTIVE:
@@ -605,12 +620,12 @@ class ResearchTaskService:
                         task_id,
                         status="failed",
                         stage="synthesizing" if row["candidates"] else "searching",
-                        error=f"{type(exc).__name__}: {exc}"[:500],
+                        error=public_error(exc),
                         error_code=500,
                         finished_at=now(),
                     )
             except TaskError:  # pragma: no cover - 存储彻底不可用
-                logger.exception("检索任务 %s 失败状态无法写回", task_id)
+                logger.error("检索任务 %s 失败状态无法写回，请核对项目存储", task_id)
 
     def _run_pipeline(self, task_id, row, payload, token, attempt):
         topic = row["topic"]
@@ -740,7 +755,6 @@ class ResearchTaskService:
             current_latest[(c.get("query"), c.get("source"))] = c
         current_statuses = list(current_latest.values())
         if outcomes and all(o.status == "error" for o in outcomes) and not resume:
-            error = "；".join(f"{o.source}: {o.error[:80]}" for o in outcomes[:3])
             self._update(
                 task_id,
                 status="failed",
@@ -748,7 +762,7 @@ class ResearchTaskService:
                 execution_log=encode(
                     log + [{"stage": "searching", "detail": "全部来源调用失败", "at": now()}]
                 ),
-                error=f"全部检索来源失败：{error}",
+                error=SOURCE_FAILURE,
                 error_code=502,
                 finished_at=now(),
             )
@@ -760,7 +774,7 @@ class ResearchTaskService:
                 task_id,
                 status="partial",
                 stage="done",
-                error=f"补跑仍未成功，失败来源：{'、'.join(failed_names)}；已交付报告保持不变",
+                error=RESUME_FAILURE,
                 error_code=502,
                 finished_at=now(),
                 execution_log=encode(
@@ -898,11 +912,11 @@ class ResearchTaskService:
                     task_id,
                     status="failed",
                     stage="synthesizing",
-                    error=f"整理阶段失败（检索结果已保留，可只重试整理）：{exc}",
+                    error=SYNTHESIS_FAILURE + public_error(exc),
                     error_code=502,
                     finished_at=now(),
                     execution_log=encode(
-                        log + [{"stage": "synthesizing", "detail": str(exc)[:200], "at": now()}]
+                        log + [{"stage": "synthesizing", "detail": public_error(exc), "at": now()}]
                     ),
                 )
                 return
@@ -1321,14 +1335,13 @@ class ResearchTaskService:
         """
         row = self._read(task_id)
         effective = self._effective(row)
-        stale_queued = row["status"] == "queued" and not task_lock_held(self.db_path)
         if effective == "partial":
             if re_search:
                 raise TaskConflict(
                     "部分完成任务请使用补跑（只重试失败部分）；需要更换检索范围时请发起新任务"
                 )
             resume = True
-        elif effective not in ("failed", "interrupted", "cancelled") and not stale_queued:
+        elif effective not in ("failed", "interrupted", "cancelled"):
             raise TaskConflict("当前状态不可重试；请先查看任务详情")
         if not row["candidates"] and not re_search and row["stage"] not in ("planning", "searching"):
             re_search = True  # 没有可复用候选时必须重新检索
@@ -1349,13 +1362,13 @@ class ResearchTaskService:
         stamp = now()
         with self._connection(True) as conn:
             current = self._row(conn, task_id)
-            # 事务内重判：并发双击时，第二次请求会看到第一次已转入 queued/running。
+            # A completed retry can be partial again; the old attempt cannot claim it.
+            if current["attempts"] != row["attempts"]:
+                raise TaskConflict("任务已收到其他重试请求，请先读取最新状态")
             cur_effective = self._effective(current)
-            cur_stale = current["status"] == "queued" and not task_lock_held(self.db_path)
             allowed = (
                 cur_effective == "partial"
                 or cur_effective in ("failed", "interrupted", "cancelled")
-                or cur_stale
             )
             if not allowed:
                 raise TaskConflict("任务仍在运行，无需重试")
@@ -1367,5 +1380,5 @@ class ResearchTaskService:
                 "WHERE task_id=?",
                 (self.PROCESS_IDENTITY, encode(payload), stamp, task_id),
             )
-        self._runner(lambda: self._execute(task_id, attempt=row["attempts"] + 1))
+        self._schedule(task_id, attempt=row["attempts"] + 1)
         return self.view(self._read(task_id))

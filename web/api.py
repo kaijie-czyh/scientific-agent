@@ -3877,6 +3877,7 @@ def _require_project(project_id: str) -> ProjectState:
 from web.workspace_api import build_workspace_router  # noqa: E402
 from web.conversation_home_api import build_home_router  # noqa: E402
 from web.project_exports_api import build_exports_router  # noqa: E402
+from web.runtime_status_api import build_runtime_status_router  # noqa: E402
 
 
 def _register_conversation_project(pid, topic, domain, created_at):
@@ -3888,6 +3889,7 @@ def _register_conversation_project(pid, topic, domain, created_at):
 
 
 app.include_router(build_home_router(lambda:_CONFIG,_require_project,_register_conversation_project))
+app.include_router(build_runtime_status_router(lambda:_CONFIG))
 app.include_router(build_exports_router(lambda:_CONFIG, _require_project,
     lambda state:_workspace_workflow(state,include_materials=True), download_artifact,
     _make_download, _md_to_docx_response, _md_to_pdf_response))

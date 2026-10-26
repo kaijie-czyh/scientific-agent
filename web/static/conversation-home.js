@@ -25,6 +25,39 @@
             return data;
         } finally {clearTimeout(timer);signal?.removeEventListener("abort",stop);}
     }
+    function runtimeBlocked(v){return !v.material?.teaching && v.runtime?.mode==='model' && v.runtime.status==='needs_configuration' && !!v.runtime.checks?.length && v.runtime.checks.every(c=>['missing_route','invalid_route','missing_credentials','unsupported_provider'].includes(c.status));}
+    function paintRuntime(v){
+        if(!current(v))return;
+        const box=v.r.runtime;box.hidden=!!v.material?.teaching;if(box.hidden)return;
+        const state=v.runtime,signature=JSON.stringify([state,v.runtimeChecking,v.runtimeError]);if(v.runtimeSignature===signature)return;v.runtimeSignature=signature;
+        const focused=box.contains(document.activeElement),open=box.querySelector('details')?.open;box.replaceChildren();
+        const details=E('details');details.open=open ?? runtimeBlocked(v);
+        details.append(E('summary','',state?.title || (v.runtimeChecking?'正在核对运行配置…':'运行配置暂不可读取')));
+        details.append(E('p','',v.runtimeError || (state?.status==='needs_configuration'&&!runtimeBlocked(v)?'部分功能配置缺失，已配置的功能仍可尝试。此检查未发送模型请求；实际可用性由请求结果确认。':state?.message) || '配置核对只读取当前设置，不调用模型。'));
+        if(state?.checks?.length){const checks=E('ul');for(const check of state.checks)checks.append(E('li',['rules_mode','configured_unverified'].includes(check.status)?'':'ch-warning',check.label+'：'+check.message));details.append(checks);}
+        for(const action of state?.actions || [])if(action.kind!=='try_teaching')details.append(E('p','muted small',action.detail));
+        const actions=E('div','ch-runtime-actions'),refresh=button(v.runtimeChecking?'核对中…':'重新读取配置',()=>loadRuntime(v),'ch-text-button');refresh.disabled=v.runtimeChecking;actions.append(refresh);
+        if(v.root.querySelector('[data-teaching="directory"]'))actions.append(button('体验离线案例',()=>v.root.querySelector('[data-teaching="directory"]').click(),'ch-text-button'));
+        details.append(actions);box.append(details);box.classList.toggle('ch-runtime-attention',state?.status==='needs_configuration');if(focused)details.querySelector('summary').focus({preventScroll:true});
+    }
+    async function loadRuntime(v){
+        if(!current(v))return;
+        if(v.runtimeRead)return v.runtimeRead;
+        v.runtimeChecking=true;v.runtimeError=null;paintRuntime(v);
+        v.runtimeRead=(async()=>{
+            try{const data=await request('/api/runtime-status',{signal:v.reads.signal,timeout:7000});if(!current(v))return;
+                if(data.schema_version!=='runtime-status.v1')throw new Error('运行配置接口版本不匹配，请更新后端后重新核对。');
+                v.runtime=data;
+            }catch(e){if(current(v)&&e.name!=='AbortError')v.runtimeError='暂时无法核对模型配置；这不代表模型可用。可以重读配置，或先体验离线案例。';}
+            finally{v.runtimeChecking=false;v.runtimeRead=null;if(current(v)){paintRuntime(v);paintHeader(v);}}
+        })();return v.runtimeRead;
+    }
+    async function allowGeneration(v){
+        if(!v.runtime)await loadRuntime(v);
+        if(!current(v))return false;
+        if(runtimeBlocked(v)){paintRuntime(v);v.r.runtime.querySelector('details').open=true;notice(v,'当前模型配置需要补齐，尚未提交本次生成请求；项目资料和草稿已保留。可以先体验离线案例。');return false;}
+        return true;
+    }
     async function capabilities() {
         if(g.cap)return g.cap;
         if(!g.capPromise)g.capPromise=(async()=>{
@@ -158,6 +191,7 @@
         v.r.send.textContent=v.busy ? "提交中…" : v.remoteBusy ? "当前会话处理中" : v.pending?.awaiting_upload ? '继续上传并发送' : v.startPending ? "核对并继续首次发送" : "发送";
         paintFile(v);
         paintResearchRoute(v);
+        paintRuntime(v);
         const ref=v.material?.teaching_reference;
         v.r.handoff.hidden=!ref || v.messages.some(m=>!m.optimistic);
         if(ref&&!v.r.handoff.hidden){
@@ -497,23 +531,32 @@
     }
     function planQuality(v,item,draft,review){
         const box=E('section','ch-plan-quality');box.setAttribute('aria-label','方案交付检查');
+        const heading=E('div','ch-quality-heading'),status=E('p','muted small'),body=E('div');status.setAttribute('role','status');
+        const refresh=button('重新核对',()=>load(true),'ch-text-button');heading.append(E('h4','','交付检查'),refresh);box.append(heading,status,body);
         let loading=false,loaded=false;
-        const load=async()=>{
-            if(loading || loaded || !current(v) || !box.isConnected)return;
-            loading=true;box.replaceChildren(E('p','muted','正在核对引用和研究条件…'));
+        const discuss=text=>preparePlanInput(v,`请和我核对方案“${item.title}”：${text}。先讨论并保留未确认信息，不自动采纳或重写方案。`,null);
+        const load=async(force=false)=>{
+            if(loading || loaded&&!force || !current(v) || !box.isConnected)return;
+            loading=true;refresh.disabled=true;status.textContent='正在核对当前资料、引用和研究条件…';
             const params=new URLSearchParams(draft ? {conversation_id:v.cid,suggestion_id:item.suggestion_id} : {item_id:item.item_id});
             try{
                 const report=await request(`/api/projects/${encodeURIComponent(v.pid)}/workspace/plan-quality?${params}`,{signal:v.reads.signal});
                 if(!current(v) || !box.isConnected)return;
                 loaded=true;box.dataset.qualityStatus=report.status;
-                box.replaceChildren(E('h4','','交付检查'),E('strong','',report.label));
-                const checks=E('ul');for(const check of report.checks){const row=E('li','',`${check.label}：${check.detail}`);row.dataset.check=check.code;checks.append(row);}box.append(checks);
+                body.replaceChildren(E('strong','',report.label));status.textContent='已按当前资料重新核对；检查不改写方案。';
+                const attention=report.checks.filter(c=>c.status==='attention'),passed=report.checks.filter(c=>c.status!=='attention');
+                if(attention.length){const list=E('ul','ch-quality-actions');for(const check of attention){const row=E('li');row.dataset.check=check.code;row.append(E('strong','',check.label),E('p','',check.detail));if(!v.material?.teaching)row.append(button('讨论这一项',()=>discuss(check.label+'：'+check.detail),'ch-text-button'));list.append(row);}body.append(E('p','ch-warning',`优先核对 ${attention.length} 项`),list);}
+                if(passed.length){const done=E('details','ch-quality-passed');done.append(E('summary','',`已完成的结构与依据检查 · ${passed.length} 项`));const list=E('ul');for(const check of passed){const row=E('li','',`${check.label}：${check.detail}`);row.dataset.check=check.code;list.append(row);}done.append(list);body.append(done);}
+                if(report.condition_details?.length){const conditions=E('details','ch-quality-conditions');conditions.append(E('summary','','逐项核对研究条件'));const list=E('dl');for(const condition of report.condition_details){const value=E('dd');value.append(E('span','',condition.value || '尚未提供'),E('small',condition.basis==='user'?'muted':'ch-warning',condition.basis==='user'?'用户提供，仍需核对适用性':'尚未由你确认'));list.append(E('dt','',condition.label),value);}conditions.append(list);body.append(conditions);}
+                else if(report.pending_conditions?.length)body.append(E('p','ch-warning','待你确认的条件：'+report.pending_conditions.join('、')));
+                if(report.unconfirmed?.length){const pending=E('details','ch-quality-pending');pending.append(E('summary','',`方案中的待讨论事项 · ${report.unconfirmed.length} 项`));const list=E('ul');for(const text of report.unconfirmed)list.append(E('li','',text));pending.append(list);body.append(pending);}
                 if(report.evidence.length){const sources=E('details');sources.append(E('summary','','逐条核对引用片段'));
-                    for(const entry of report.evidence){const row=E('section','ch-quality-citation');row.append(E('p','',entry.statement),button(entry.title,()=>openMaterial(v,'papers',entry.paper_id),'ch-text-button'),E('p','muted small',entry.location),E('blockquote','',entry.quote || '尚未提供引用片段'));sources.append(row);}box.append(sources);}
-                const questions=E('details');questions.append(E('summary','','研究者审阅要点'));for(const text of report.review_questions)questions.append(E('p','',text));box.append(questions,E('p','muted small',report.notice));
-                if(!v.material?.teaching && report.status==='needs_attention')box.append(button('讨论待补充项',()=>{panel(v,false);preparePlanInput(v,`请和我核对方案“${item.title}”的待补充项：${report.checks.filter(c=>c.status==='attention').map(c=>c.detail.replace(/[。；]+$/,'')).join('；')}。先讨论，不自动采纳或重写方案。`,null);}));
-            }catch(e){if(current(v) && box.isConnected){box.replaceChildren(E('p','ch-warning','交付检查暂不可用，请重试；原方案仍保留。'),button('重新检查',load));}}
-            finally{loading=false;}
+                    for(const entry of report.evidence){const row=E('section','ch-quality-citation');row.append(E('p','',entry.statement));if(entry.paper_id)row.append(button(entry.title,()=>openMaterial(v,'papers',entry.paper_id),'ch-text-button'));else row.append(E('strong','',entry.title));row.append(E('p',entry.matched?'muted small':'ch-warning',entry.location),E('blockquote','',entry.quote || '尚未提供引用片段'));if(!v.material?.teaching)row.append(button('讨论这条依据',()=>discuss(`陈述“${entry.statement}”引用“${entry.title}”的片段“${entry.quote || '未提供'}”；请核对这条引用是否支持陈述，以及需要补充的材料`),'ch-text-button'));sources.append(row);}body.append(sources);}
+                if(report.material_review?.length){const materials=E('details','ch-quality-materials');materials.append(E('summary','','材料数值与比较条件 · 审阅线索'),E('p','muted small',report.material_notice || '原文线索只供人工审阅，不表示数据已经可比或得到验证。'));for(const entry of report.material_review){const row=E('section','ch-quality-citation');row.append(E('p','',entry.statement));if(entry.source_matched){const list=E('dl');for(const [label,values] of [['数值与单位',entry.quantities],['温度',entry.temperatures],['样品与测试条件',entry.condition_mentions]])list.append(E('dt','',label),E('dd','',values?.join('；') || '当前片段未识别到，请核对原文'));list.append(E('dt','','数据类型线索'),E('dd','',({experimental:'出现实验相关用语',computational:'出现计算相关用语',mixed:'同时出现实验和计算用语',unspecified:'当前片段未能区分'})[entry.evidence_type] || '需人工区分'));row.append(list);}for(const text of entry.review_points || [])row.append(E('p','ch-warning',text));if(!v.material?.teaching)row.append(button('讨论比较条件',()=>discuss(`针对“${entry.statement}”，请核对单位、测试温度、样品与测量条件、实验或计算数据类型；缺失信息保持待确认`),'ch-text-button'));materials.append(row);}body.append(materials);}
+                const questions=E('details');questions.append(E('summary','','研究者审阅要点'));for(const text of report.review_questions)questions.append(E('p','',text));body.append(questions,E('p','muted small',report.notice));
+                if(!v.material?.teaching && attention.length)body.append(button('讨论待补充项',()=>discuss(attention.map(c=>c.detail.replace(/[。；]+$/,'')).join('；'))));
+            }catch(e){if(current(v) && box.isConnected && e.name!=='AbortError')status.textContent=loaded?'本次核对失败，下方保留上次检查，请重新核对后再判断。':'交付检查暂不可用，请重新核对；原方案仍保留。';}
+            finally{loading=false;refresh.disabled=false;}
         };
         review.addEventListener('toggle',()=>{if(review.open)load();});
         return box;
@@ -544,14 +587,14 @@
         const metadata=E("details","ch-plan-metadata");metadata.append(E("summary","","版本与技术详情"),E("p","muted small",`模板：${item.plan?.template_version || '旧结构'}；记录：${item.item_id || item.suggestion_id}；问题记录：${q?.item_id || '需核对'}；修订记录：${item.supersedes_id || '无'}`));box.append(metadata);
         const controls=E("div","ch-plan-controls");
         if(v.material?.teaching){
-            controls.append(button("修改条件",()=>window.SRA_TEACHING.revise(v)),button("讨论某一部分",()=>{panel(v,false);preparePlanInput(v,"这个方案需要什么条件？",null);}));
+            controls.append(button("修改条件",()=>window.SRA_TEACHING.revise(v)),button("讨论某一部分",()=>preparePlanInput(v,"这个方案需要什么条件？",null)));
             if(draft && !item.applied_item_id){const b=button(stale ? "依据待复核，不能直接采纳" : "保存当前方案",()=>adopt(v,item.suggestion_id));b.dataset.caseOption="adopt_plan";b.disabled=stale || v.adopting;controls.append(b);}
         }
         else {
-        controls.append(button("讨论某一部分",()=>{panel(v,false);preparePlanInput(v,`请讨论${item.title}的某一部分（请填写章节）：`,null);}));
+        controls.append(button("讨论某一部分",()=>preparePlanInput(v,`请讨论${item.title}的某一部分（请填写章节）：`,null)));
         if(g.cap?.research_search)controls.append(button("准备检索依据",()=>preparePlanInput(v,`请帮我检索${v.material?.workflow?.flow?.question?.title || projectName(v.pid)}的代表性论文。`,null)));
         if(!draft && v.material?.workflow?.flow?.plan?.item_id!==item.item_id && !stale)controls.append(button("设为当前方案",async()=>{try{await request(`/api/projects/${encodeURIComponent(v.pid)}/workspace/focus`,{method:"PUT",body:{expected_revision:v.material.workspace.revision,focus:{question:item.plan?.question_id || item.related_ids[0],plan:item.item_id}}});await refreshMaterials(v);}catch(e){fail(v,e);}}));
-        controls.append(button('修改条件',()=>{panel(v,false);preparePlanInput(v,'请讨论并修订这份方案的条件，变更要求：',{method:item.plan?.method || null,question_id:item.plan?.question_id || null,supersedes_id:draft ? item.supersedes_id || null : item.item_id});}));
+        controls.append(button('修改条件',()=>preparePlanInput(v,'请讨论并修订这份方案的条件，变更要求：',{method:item.plan?.method || null,question_id:item.plan?.question_id || null,supersedes_id:draft ? item.supersedes_id || null : item.item_id})));
         if(!draft)controls.append(button("请求修订方案",()=>preparePlanInput(v,`请修订方案“${item.title}”，修改要求：`,{method:item.plan?.method || null,question_id:item.plan?.question_id || item.related_ids?.find(id=>v.material.workspace.items.some(i=>i.item_id===id && i.kind==="question")),supersedes_id:item.item_id})));
         if(draft && !item.applied_item_id){const b=button(stale ? "依据待复核，不能直接采纳" : "采纳方案",()=>adopt(v,item.suggestion_id));b.disabled=stale || v.adopting;controls.append(b);}
         if(draft && !item.applied_item_id)controls.append(button("编辑草案修订要求",()=>preparePlanInput(v,`请重新起草${item.title}，修改要求：`,{method:item.plan?.method || null,question_id:item.plan?.question_id || null,supersedes_id:item.supersedes_id || null})));
@@ -562,10 +605,26 @@
         const list=E('ul','ch-plan-preview-list');for(const [key,label] of [['objective','要研究什么'],['method','准备怎么研究'],['validation','如何判断'],['conditions','需要的条件']]){const text=s.plan.sections.find(sec=>sec.key===key)?.statements.map(st=>st.text).join('；') || '尚待确认';const n=E('li','',label+'：'+text.slice(0,110)+(text.length>110?'…':''));n.title=text;list.append(n);}list.append(E('li','','待确认：'+s.plan.unconfirmed.slice(0,2).join('；')));p.append(list);
         if(!s.applied_item_id && (s.basis_changed!==false || !s.material_fingerprint))p.append(E('p','ch-warning','依据待复核；可查看原草案，不能直接采纳。'));
         p.append(button('打开方案',()=>openMaterial(v,'proposal',s.suggestion_id)));return p;}
-    function preparePlanInput(v,text,request){
-        if(v.r.input.value.trim() && !window.confirm("输入框已有草稿，是否保留并追加这段方案要求？"))return;
-        v.r.input.value=v.r.input.value.trim() ? v.r.input.value+"\n\n"+text : text;
-        v.planRequest=request;if(request){v.r.planMethod.value=request.method || "";v.r.planQuestion.value=request.question_id || "";}v.r.planPending.textContent=request ? "下一次发送将请求方案草案；尚未调用模型，可取消或继续编辑。" : "";v.r.planTools.open=false;saveDraft(v);v.r.input.focus();
+    async function preparePlanInput(v,text,request){
+        if(!current(v) || v.preparingPlan)return false;
+        const discussion=!request&&v.planRequest;
+        if(v.r.input.value.trim() || discussion){
+            v.preparingPlan=true;let use=false;
+            try{use=await new Promise(resolve=>{
+                const dialog=E('dialog','ch-reply-confirm');dialog.setAttribute('aria-label','保留草稿并追加要求');
+                dialog.append(E('h3','','保留现有草稿，追加这段要求？'),E('p','',text));
+                if(discussion)dialog.append(E('p','','这次将切换为普通讨论，清除附加的方案生成请求；原文字保留。'));
+                const done=value=>{v.reads.signal.removeEventListener('abort',abort);if(dialog.open)dialog.close();dialog.remove();resolve(value);},abort=()=>done(false);
+                const keep=button('保留草稿，暂不追加',()=>done(false));dialog.append(keep,button('保留并追加',()=>done(true)));dialog.addEventListener('cancel',e=>{e.preventDefault();done(false);},{once:true});
+                v.reads.signal.addEventListener('abort',abort,{once:true});v.root.append(dialog);dialog.showModal();keep.focus();
+            });}finally{v.preparingPlan=false;}
+            if(!use || !current(v))return false;
+        }
+        const next=v.r.input.value.trim() ? v.r.input.value+"\n\n"+text : text;
+        if(next.length>v.r.input.maxLength){notice(v,'追加后的内容超过输入长度上限，请先整理现有草稿再准备要求；原草稿已保留。');return false;}
+        v.r.input.value=next;
+        v.planRequest=request;if(request){v.r.planMethod.value=request.method || "";v.r.planQuestion.value=request.question_id || "";}v.r.planPending.textContent=request ? "下一次发送将请求方案草案；尚未调用模型，可取消或继续编辑。" : "";v.r.planTools.open=false;saveDraft(v);if(!v.r.panel.hidden)panel(v,false,{restore:false});v.r.input.focus();
+        v.r.input.dispatchEvent(new Event('input'));return true;
     }
     async function chooseReply(v,message,option){
         if(!current(v) || v.busy || v.remoteBusy || v.optionSending)return;
@@ -734,7 +793,8 @@
         });
     }
     async function firstSend(v,text){
-        if(v.busy || !v.writable)return;
+        if(v.busy || v.remoteBusy || !v.writable)return;
+        if(!await allowGeneration(v) || v.busy || v.remoteBusy)return;
         try{attachment(v,{requireFile:true});}catch(e){fail(v,e);paintFile(v);return;}
         if(v.material?.teaching&&!v.cid){notice(v,'请继续原案例，或明确开始自己的研究；这里不会创建不可使用的对话。');return;}
         if(!v.pid && !v.startPending && (!v.r.domain.value || !v.domainConfirmed)){if(v.domainDialog)return;v.domainDialog=true;const ok=await confirmDomain(v);v.domainDialog=false;if(!ok||!current(v))return;}
@@ -785,8 +845,8 @@
         }
         finally{v.busy=false;paintHeader(v);}
     }
-    async function retry(v,rid){if(v.busy || v.remoteBusy)return;await postMessage(v,{request_id:rid},true);}
-    async function resend(v){if(v.busy || v.remoteBusy || !v.pending)return;if(v.pending.awaiting_upload){await firstSend(v,v.pending.body.content);return;}await postMessage(v,v.pending.body);}
+    async function retry(v,rid){if(v.busy || v.remoteBusy)return;if(!await allowGeneration(v) || v.busy || v.remoteBusy)return;await postMessage(v,{request_id:rid},true);}
+    async function resend(v){if(v.busy || v.remoteBusy || !v.pending)return;if(!await allowGeneration(v) || v.busy || v.remoteBusy || !v.pending)return;if(v.pending.awaiting_upload){await firstSend(v,v.pending.body.content);return;}await postMessage(v,v.pending.body);}
     function panel(v,open,{refresh=true,restore=true}={}){
         if(!current(v))return;
         const wasOpen=!v.r.panel.hidden,center=v.root.querySelector('.ch-center');
@@ -948,9 +1008,11 @@
         </div><aside data-ref="panel" class="ch-material-panel" aria-label="当前项目研究材料" hidden><div class="ch-panel-header"><h2>研究材料</h2><button type="button" data-ref="panelWide" class="btn btn-secondary">扩大阅读</button><button type="button" data-ref="panelClose" class="btn btn-secondary">返回对话</button><div class="ch-material-tabs" data-ref="materialTabs" role="tablist" aria-label="研究材料分类"></div></div><div class="ch-material-scroll" data-ref="materialScroll" tabindex="0"><div data-ref="researchSummary" class="ch-overview" data-material-group="overview"><h3>研究概况</h3><p data-ref="confirmedQuestion"></p><p data-ref="confirmedBrief"></p><p data-ref="summaryHint"></p><button type="button" class="ch-text-button" data-ref="pendingItems">查看待确认事项</button><details class="ch-overview-stages"><summary>四阶段与正式材料状态</summary><ol data-ref="stageList"><li></li><li></li><li></li><li></li></ol><p>当前阶段来自已保存材料；讨论入口不代表前面步骤已完成。流程止于研究方案，不执行实验。</p></details></div><div data-ref="materialBody"></div><button type="button" class="ch-text-button" data-ref="refresh">刷新材料与草案</button></div></aside></div>`;
         const actions=root.querySelector('.ch-heading-actions');
         root.querySelector('.ch-welcome p').after(E('p','ch-first-send-note','直接输入或先选论文，首次发送后才建立独立项目。'));
+        const runtime=E('section','ch-runtime');runtime.dataset.ref='runtime';runtime.setAttribute('aria-label','运行配置与离线体验');runtime.setAttribute('role','status');root.querySelector('.ch-compose').prepend(runtime);
         const planTools=E("details","ch-plan-tools");planTools.dataset.ref="planTools";planTools.hidden=true;
         planTools.innerHTML='<summary>方案生成与审阅</summary><label>研究问题<select data-ref="planQuestion" aria-label="方案关联问题"></select></label><label>研究方法<select data-ref="planMethod" aria-label="方案研究方法"><option value="">尚未确定（先澄清）</option><option value="computational">计算研究</option><option value="theoretical">理论研究</option><option value="experimental">实验研究设计（仅规划）</option></select></label><p class="muted small">领域不决定方法。此处只准备可编辑请求，发送后才生成草案，不执行实验。</p><button type="button" class="btn btn-secondary" data-ref="preparePlan">准备生成方案请求</button><button type="button" class="ch-text-button" data-ref="cancelPlan">取消方案请求</button><p role="status" data-ref="planPending"></p>';
         root.querySelector('.ch-settings').after(planTools);
+        const planPending=planTools.querySelector('[data-ref="planPending"]');planPending.className='ch-plan-pending';planTools.after(planPending);
         const planEligibility=E('p','muted small');planEligibility.dataset.ref='planEligibility';planTools.querySelector('[data-ref="preparePlan"]').before(planEligibility);
         planTools.addEventListener('toggle',()=>{if(planTools.open)root.querySelector('.ch-settings').open=false;});
         root.querySelector('.ch-settings').addEventListener('toggle',e=>{if(e.target.open)planTools.open=false;});
@@ -1003,6 +1065,7 @@
         root.addEventListener("keydown",e=>{if(e.key==='Tab'&&!r.panel.hidden&&innerWidth<=900){const nodes=[...r.panel.querySelectorAll('button:not(:disabled):not([tabindex="-1"]),a[href],input,summary,[tabindex="0"]')].filter(n=>n.getClientRects().length);const first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}});
         r.messages.addEventListener("scroll",()=>{r.latest.hidden=r.messages.scrollHeight-r.messages.scrollTop-r.messages.clientHeight<60;});
         paintHeader(v);paintMessages(v);paintMaterials(v);paintProjects();conversations(v.pid);recentConversations();
+        loadRuntime(v);
         (async()=>{
             try{const cap=await capabilities();if(!current(v))return;
                 for(const d of cap.domains)r.domain.add(new Option(d.label,d.value));r.domain.value=v.domainConfirmed ? draft.domain || '' : '';

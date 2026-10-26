@@ -7,6 +7,7 @@ from pydantic import Field
 
 from core.workspace.plan_schema import ResearchPlan
 from core.workspace.schema import Contract
+from core.workspace.material_review import MATERIAL_NOTICE, MaterialReview, review_material_evidence
 
 
 NOTICE = "仅核对当前资料、引用片段和条件；不证明引文支持论断、科学正确性、创新性或可发表性。"
@@ -37,6 +38,13 @@ class CitationCheck(Contract):
     page: int | None = None
 
 
+class ConditionDetail(Contract):
+    field: str
+    label: str
+    value: str
+    basis: Literal["user", "unverified"]
+
+
 class PlanQualityReport(Contract):
     version: Literal[1] = 1
     target_id: str
@@ -46,6 +54,9 @@ class PlanQualityReport(Contract):
     checks: list[DeliveryCheck]
     evidence: list[CitationCheck] = Field(default_factory=list)
     pending_conditions: list[str] = Field(default_factory=list)
+    condition_details: list[ConditionDetail] = Field(default_factory=list)
+    material_review: list[MaterialReview] = Field(default_factory=list)
+    material_notice: str = MATERIAL_NOTICE
     unconfirmed: list[str] = Field(default_factory=list)
     review_questions: list[str] = Field(default_factory=list)
     notice: str = NOTICE
@@ -60,7 +71,7 @@ def assess_plan(plan: ResearchPlan | None, papers, chunks, *, target_id,
         code="basis", label="材料版本", status="attention" if needs_review else "pass",
         detail="方案或关联问题的依据已变化，先复核再修订。" if needs_review else "未发现已标记的依据变更。",
     )]
-    evidence, pending = [], []
+    evidence, pending, material_review = [], [], []
     if plan:
         for section in plan.sections:
             for statement in section.statements:
@@ -107,12 +118,27 @@ def assess_plan(plan: ResearchPlan | None, papers, chunks, *, target_id,
                 code="reading_scope", label="阅读范围", status="attention",
                 detail="部分依据仅来自摘要，方法细节和精确参数仍需合法原文核对。",
             ))
+        context = "\n".join([
+            *(statement.text for section in plan.sections for statement in section.statements),
+            *plan.method_details.model_dump().values(),
+        ])
+        material_review = review_material_evidence(evidence, context=context)
+        if material_review:
+            checks.append(DeliveryCheck(
+                code="material_comparability", label="材料性质与可比性", status="attention",
+                detail="已整理引用中的数值、条件与实验／计算线索，请逐项人工复核；不以关键词匹配判定公平比较或研究创新。",
+            ))
     attention = any(c.status == "attention" for c in checks)
     return PlanQualityReport(
         target_id=target_id, workspace_revision=workspace_revision,
         status="legacy" if plan is None else "needs_attention" if attention else "ready_for_discussion",
         label="历史方案，需人工审阅" if plan is None else "有待补充或复核项" if attention else "可供讨论，仍需专业审阅",
         checks=checks, evidence=evidence, pending_conditions=pending,
+        condition_details=[ConditionDetail(field=field, label=label,
+                                          value=getattr(plan.conditions, field).value,
+                                          basis=getattr(plan.conditions, field).basis)
+                           for field, label in CONDITIONS.items()] if plan else [],
+        material_review=material_review,
         unconfirmed=plan.unconfirmed if plan else [],
         review_questions=[
             "引文是否真正支持对应陈述，而不只是出现相同词句？",
@@ -126,9 +152,23 @@ def render_quality(report: PlanQualityReport):
     lines = ["## 交付检查（依据当前资料）", report.label, "> " + report.notice]
     for check in report.checks:
         lines.append(f"- {check.label}：{check.detail}")
+    for condition in report.condition_details:
+        basis = "用户提供" if condition.basis == "user" else "待用户确认"
+        lines.append(f"- {condition.label}（{basis}）：{condition.value}")
     for entry in report.evidence:
         lines += [f"- 引用：{entry.title}；{entry.location}；DOI：{entry.doi or '未提供'}",
                   "> 对应陈述：" + entry.statement.replace("\n", " "),
                   "> 引用片段：" + entry.quote.replace("\n", " ")]
+    if report.material_review:
+        lines += ["### 材料性质与可比性审阅", "> " + report.material_notice]
+        for row in report.material_review:
+            lines.append("- 对应陈述：" + row.statement.replace("\n", " ") + "；来源 ID：" + row.paper_id)
+            if row.source_matched:
+                labels = {"experimental": "实验线索", "computational": "计算线索", "mixed": "实验与计算线索并存", "unspecified": "未明确识别"}
+                lines += ["- 数值／单位片段：" + "；".join(row.quantities or ["未识别"]),
+                          "- 温度片段：" + "；".join(row.temperatures or ["未识别"]),
+                          "- 条件词：" + "；".join(row.condition_mentions or ["未识别"]),
+                          "- 证据类型线索：" + labels[row.evidence_type] + "；" + "、".join(row.evidence_type_mentions)]
+            lines += ["- 待复核：" + question for question in row.review_points]
     lines += ["### 研究者审阅要点", *["- " + question for question in report.review_questions]]
     return "\n\n".join(lines)
