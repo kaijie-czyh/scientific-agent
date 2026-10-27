@@ -49,6 +49,10 @@ from core.workspace.service import WorkspaceError
 TERMINAL = ("completed", "partial", "failed", "interrupted", "cancelled")
 ACTIVE = ("queued", "running")
 STAGES = ("planning", "searching", "ranking", "saving", "synthesizing", "delivering", "done")
+STATUS_LABELS = {
+    "completed": "已完成", "partial": "部分完成（有来源失败）", "failed": "失败",
+    "interrupted": "已中断，可重试", "cancelled": "已取消", "queued": "排队中", "running": "运行中",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -342,15 +346,7 @@ class ResearchTaskService:
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "limits": self.limits.as_dict(),
-            "status_label": {
-                "completed": "已完成",
-                "partial": "部分完成（有来源失败）",
-                "failed": "失败",
-                "interrupted": "已中断，可重试",
-                "cancelled": "已取消",
-                "queued": "排队中",
-                "running": "运行中",
-            }[status],
+            "status_label": STATUS_LABELS[status],
         }
         if include_report and status in ("completed", "partial", "cancelled", "failed"):
             view["report"] = report
@@ -961,7 +957,7 @@ class ResearchTaskService:
         }
 
     def _save_papers(self, task_id, ranked):
-        """入库新论文；已有论文只关联不覆盖。返回 (saved_ids, linked_ids, skipped)。"""
+        """入库新论文；已有论文只补空字段。返回 (saved_ids, linked_ids, skipped)。"""
         store = KnowledgeStore(self.db_path)
         existing = {p.paper_id: p for p in store.list_papers()}
         by_doi = {
@@ -974,12 +970,9 @@ class ResearchTaskService:
         for candidate in ranked:
             doi = (candidate.get("doi") or "").lower()
             arxiv = (candidate.get("arxiv_id") or "").lower()
-            if candidate.get("paper_id") in existing:
-                # 本任务此前已入库（重试），不重复入库。
-                linked.append(candidate["paper_id"])
-                continue
-            match = by_doi.get(doi) or by_arxiv.get(arxiv)
+            match = candidate.get("paper_id") if candidate.get("paper_id") in existing else by_doi.get(doi) or by_arxiv.get(arxiv)
             if match:
+                self._supplement_paper(match, candidate)
                 linked.append(match)
                 candidate["paper_id"] = match
                 continue
@@ -1010,6 +1003,27 @@ class ResearchTaskService:
             by_arxiv[arxiv] = paper.paper_id if arxiv else by_arxiv.get(arxiv)
             saved.append(paper.paper_id)
         return saved, linked, skipped
+
+    def _supplement_paper(self, paper_id, candidate):
+        # Read and fill under one write transaction; never replace user edits.
+        with self._connection(True) as conn:
+            row = conn.execute("SELECT content FROM papers WHERE paper_id=?", (paper_id,)).fetchone()
+            if row is None:
+                raise TaskError("关联资料已变化，未覆盖或补造原文，请核对后重试")
+            paper = Paper.model_validate_json(row["content"])
+            updates = {}
+            for field in ("title", "abstract", "authors", "year", "venue", "url", "doi", "arxiv_id"):
+                current, incoming = getattr(paper, field), candidate.get(field)
+                empty = current is None or current == [] or isinstance(current, str) and not current.strip()
+                supplied = incoming is not None and incoming != [] and (not isinstance(incoming, str) or bool(incoming.strip()))
+                if empty and supplied:
+                    updates[field] = incoming
+            if not updates:
+                return
+            if "abstract" in updates and not paper.metadata.get("reading_scope"):
+                updates["metadata"] = {**paper.metadata, "reading_scope": "摘要（本轮检索补充，未核对全文）"}
+            updated = Paper.model_validate({**paper.model_dump(mode="json"), **updates})
+            conn.execute("UPDATE papers SET content=? WHERE paper_id=?", (updated.model_dump_json(), paper_id))
 
     # ---- 交付与终态 ----
 
@@ -1291,6 +1305,17 @@ class ResearchTaskService:
 
     def get(self, task_id):
         return self.view(self._read(task_id))
+
+    def report_version(self, task_id, version):
+        """Read one saved report body; polling keeps version metadata lightweight."""
+        row = self._read(task_id)
+        versions = json.loads(row.get("report_versions") or "[]")
+        entry = next((v for v in versions if v.get("version") == version), None)
+        if entry is None:
+            raise TaskNotFound(f"报告版本 v{version} 不存在")
+        if not isinstance(entry.get("report"), dict) or not entry["report"]:
+            raise TaskError("该报告版本正文不可用，未用当前报告替代，请核对已有资料")
+        return entry
 
     def list(self, cid, limit=20, offset=0):
         with self._connection() as conn:

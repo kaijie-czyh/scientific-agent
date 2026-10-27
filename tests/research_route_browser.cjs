@@ -40,9 +40,16 @@ const base=process.env.SRA_ROUTE_URL || 'http://127.0.0.1:8069',out=path.resolve
   await page.getByRole('button',{name:'开始检索',exact:true}).click();
   await page.locator('.ch-task-card > summary').filter({hasText:/已完成/}).waitFor({timeout:40000});
   await page.waitForFunction(()=>document.querySelector('[data-ref="beginResearchStep"]')?.textContent==='阅读已有论文');
+  await page.getByText('本轮检索摘要 · v1',{exact:true}).waitFor();
+  assert.match(await page.locator('.ch-task-result').innerText(),/摘要|元信息/);
+  assert.match(await page.locator('.ch-task-result').innerText(),/未阅读全文|未核对全文/);
   assert.ok((await get(root+'/workspace?include_chat=false')).papers.length);
   const sources=(await get('/__reliability__/state')).source_calls.length;
-  await action().click();await complete();
+  const beforeReading=(await get('/__reliability__/state')).model_calls.length;
+  await page.getByRole('button',{name:'阅读这批资料',exact:true}).click();
+  assert.match(await page.locator('#ch-input').inputValue(),/本次参考/);
+  assert.equal((await get('/__reliability__/state')).model_calls.length,beforeReading);
+  await page.locator('[data-ref="send"]').click();await complete();
   assert.equal((await get('/__reliability__/state')).source_calls.length,sources);
   await select('synthesis');await action().click();await complete();
   assert.equal((await get('/__reliability__/state')).source_calls.length,sources);
@@ -76,6 +83,7 @@ const base=process.env.SRA_ROUTE_URL || 'http://127.0.0.1:8069',out=path.resolve
   await page.locator('[data-ref="downloadToggle"]').click();
   const endCalls=(await get('/__reliability__/state')).model_calls.length;
   await page.reload();await ready();await page.locator('.ch-research-route').waitFor();
+  await page.getByText('本轮检索摘要 · v1',{exact:true}).waitFor();
   assert.equal((await get(conv)).conversation.discussion_step,'design');assert.equal((await get('/__reliability__/state')).model_calls.length,endCalls);
   await page.setViewportSize({width:390,height:844});await select('reading');
   await page.locator('#ch-input').fill('这段尚未发送的想法要保留');await select('synthesis');assert.equal(await page.locator('#ch-input').inputValue(),'这段尚未发送的想法要保留');

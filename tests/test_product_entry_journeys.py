@@ -1,6 +1,8 @@
 """Entry choices reuse real project routes; offline HTTP and temporary data only."""
 
 import pytest
+import json
+from types import SimpleNamespace
 
 from tests.test_conversation_home import home, tree
 from tests.test_local_product_acceptance import no_network, ok, product
@@ -282,3 +284,181 @@ def test_switching_entry_keeps_old_draft_without_executing_old_intent(
         if message["role"] == "user"
     ]
     assert saved_users == [content] and saved_users[0].startswith(old_draft)
+
+
+@pytest.fixture
+def offline_journey(product, monkeypatch):
+    """Real HTTP/state/validation; only source and model output edges are fixtures."""
+    from core.llm import LLMRegistry
+    from core.research_tasks import sources
+    from core.workspace.guide import rule_guidance
+    from tests.test_research_plan_templates import model
+    from tests.test_research_tasks import SourceControl, make_paper
+
+    h = product
+    h.config.dry_run = False
+    source = SourceControl()
+    source.default = lambda name, query, seq: [make_paper(
+        seq, query, doi=f"10.0000/journey-{seq}",
+        title=f"离线流程资料 {seq}：联邦学习比较",
+        abstract="JOURNEY_SOURCE_TEXT：软件测试摘要，并非真实论文或科研证据；比较条件仍待核对。",
+    )]
+    monkeypatch.setattr(sources, "SOURCE_FUNCS", {
+        "openalex": source("openalex"), "arxiv": source("arxiv"),
+    })
+    model_calls, guidance_calls = [], []
+
+    class OfflineRegistry:
+        def complete(self, task_type, *, prompt):
+            model_calls.append(task_type)
+            if task_type == "research_plan":
+                output = {"queries": [{"query": "federated learning comparison", "rationale": "离线软件验收"}]}
+            elif task_type == "research_rank":
+                candidates = json.loads(prompt.split("\n候选：", 1)[1])
+                output = {"rankings": [{"index": c["index"], "reason": "本轮比较主题的离线资料", "relevant": True} for c in candidates]}
+            elif task_type == "research_synthesize":
+                candidates = json.loads(prompt.split("候选文献：", 1)[1].split("\n来源执行情况", 1)[0])
+                output = {"representative": [{"paper_id": c["paper_id"], "point": "仅依据离线测试摘要，尚未核对全文。"} for c in candidates],
+                          "methods_relations": "测试摘要只用于软件验收，具体比较条件仍待核实。", "limitations": []}
+            else:
+                raise AssertionError("Unexpected model task in offline journey: " + task_type)
+            return SimpleNamespace(text=json.dumps(output, ensure_ascii=False))
+
+    registry = OfflineRegistry()
+    monkeypatch.setattr(LLMRegistry, "from_config", classmethod(lambda cls, cfg: registry))
+
+    def generate(registry, area, domain, text, context, purpose):
+        guidance_calls.append((area, text))
+        if context.get("plan_generation", {}).get("allowed"):
+            return model(context, literature=any(p.get("abstract") for p in context["papers"]))
+        draft = rule_guidance(area, text, context)
+        for suggestion in draft.suggestions:
+            if suggestion.kind == "question":
+                suggestion.paper_ids = [p["paper_id"] for p in context["papers"][:1]]
+        return draft
+
+    monkeypatch.setattr("web.workspace_api.generate_guidance", generate)
+    return SimpleNamespace(h=h, source=source, model_calls=model_calls, guidance_calls=guidance_calls)
+
+
+def journey_message(journey, identity, step, text, request_id, paper_ids=()):
+    h = journey.h
+    pid, cid = identity["project_id"], identity["conversation_id"]
+    base = f"/api/projects/{pid}/conversations/{cid}"
+    ok(h.client.patch(base, json={"discussion_step": step}))
+    return ok(h.client.post(base + "/messages", json={
+        "request_id": request_id, "content": text, "selected_paper_ids": list(paper_ids),
+    }))
+
+
+@pytest.mark.parametrize("entry", [0, 3, 2], ids=["newbie-search", "bring-paper", "existing-question"])
+def test_complete_entry_journey_requires_confirmation_and_exports_actual_basis(
+    offline_journey, entry
+):
+    from tests.test_research_tasks import wait_terminal
+
+    journey, h = offline_journey, offline_journey.h
+    identity = begin(h, entry, "complete-journey")
+    pid, cid = identity["project_id"], identity["conversation_id"]
+    root, base = f"/api/projects/{pid}", f"/api/projects/{pid}/conversations/{cid}"
+    paper_ids, task_id = [], None
+
+    if entry == 0:
+        first = journey_message(journey, identity, "conditions",
+            "我没有做过科研，对联邦学习的数据差异感兴趣；设备与时间还不确定。", "first-interest")
+        assert first["status"] == "completed" and not workspace(h, pid)["items"]
+        assert not journey.source.calls and not journey.model_calls
+        # The user confirms the bounded search once; a repeated request reuses it.
+        search = {"request_id": "bounded-search", "content": "确认检索联邦学习数据差异的代表性资料",
+                  "topic": "联邦学习数据差异", "year_from": 2023, "year_to": 2025}
+        started = ok(h.client.post(base + "/research-tasks", json=search))
+        task_id = started["task_id"]
+        report = wait_terminal(h, pid, cid, task_id)
+        assert report["status"] == "completed", report
+        assert report["year_from"] == 2023 and report["year_to"] == 2025
+        assert len(report["queries"]) <= report["limits"]["max_queries"]
+        assert len(report["source_calls"]) <= report["limits"]["max_queries"] * report["limits"]["sources_per_query"]
+        paper_ids = report["saved_paper_ids"]
+        assert paper_ids and report["report"]["representative"]
+        assert {p["paper_id"] for p in report["report"]["representative"]} <= set(paper_ids)
+        assert "摘要" in report["report_markdown"]
+        calls = (len(journey.source.calls), len(journey.model_calls))
+        assert ok(h.client.post(base + "/research-tasks", json=search))["task_id"] == task_id
+        assert (len(journey.source.calls), len(journey.model_calls)) == calls
+        assert not workspace(h, pid)["items"]
+    elif entry == 3:
+        paper_ids = [upload_readable(h, pid)]
+        assert not journey.source.calls and not workspace(h, pid)["items"]
+
+    if paper_ids:
+        reading = journey_message(journey, identity, "reading",
+            "请只阅读已有资料，说明阅读范围和待核查点；不要检索，不生成方案。", "read-basis", paper_ids[:1])
+        saved_papers = ok(h.client.get(root + "/workspace?include_chat=false"))["papers"]
+        source_paper = next(p for p in saved_papers if p["paper_id"] == paper_ids[0])
+        assert source_paper["title"] in reading["messages"][-1]["content"]
+        assert "阅读范围" in reading["messages"][-1]["content"]
+        assert source_paper["abstract"][:40] in reading["messages"][-1]["content"]
+        assert paper_ids[0] in reading["messages"][-1]["cited_paper_ids"]
+        assert not workspace(h, pid)["items"]
+    else:
+        source_paper = None
+
+    retrieval_calls = (len(journey.source.calls), len(journey.model_calls))
+    candidate = journey_message(journey, identity, "question",
+        "我的研究问题是：在相同公开任务与数据划分下如何公平比较 FedAvg 与 FedProx？\n请帮我整理为待确认的问题，先不生成方案。",
+        "question-candidate", paper_ids[:1])
+    proposed_question = next(s for s in candidate["suggestions"] if s["kind"] == "question")
+    assert not proposed_question["applied_item_id"] and not workspace(h, pid)["items"]
+    adopted_question = ok(h.client.post(base + f"/suggestions/{proposed_question['suggestion_id']}/apply",
+        json={"expected_revision": workspace(h, pid)["revision"]}))["item"]
+    assert adopted_question["kind"] == "question"
+    assert [i["kind"] for i in workspace(h, pid)["items"]] == ["question"]
+
+    ok(h.client.patch(base, json={"discussion_step": "design"}))
+    before_plan = formal_state(h, pid)
+    planned = ok(h.client.post(base + "/messages", json={
+        "request_id": "explicit-plan", "content": "请为已确认问题生成计算研究方案；设备、时间、预算和数据权限仍待确认。",
+        "plan_request": {"method": "computational", "question_id": adopted_question["item_id"]},
+    }))
+    draft = next(s for s in planned["suggestions"] if s["kind"] == "plan")
+    assert not draft["applied_item_id"] and draft["plan"]["question_id"] == adopted_question["item_id"]
+    assert formal_state(h, pid) == before_plan
+    assert all(c["basis"] == "unverified" and c["value"] == "待确认" for c in draft["plan"]["conditions"].values())
+
+    # Reading the review and exporting an unadopted draft are both read-only.
+    before_review = tree(h.root)
+    calls = len(journey.guidance_calls)
+    quality = ok(h.client.get(root + f"/workspace/plan-quality?conversation_id={cid}&suggestion_id={draft['suggestion_id']}"))
+    assert quality["status"] == "needs_attention" and quality["pending_conditions"]
+    draft_export = h.client.get(base + f"/suggestions/{draft['suggestion_id']}/export")
+    assert draft_export.status_code == 200 and "未采纳" in draft_export.text
+    assert "待确认" in draft_export.text and adopted_question["title"] in draft_export.text
+    if source_paper:
+        assert draft["plan"]["references"] == [source_paper["paper_id"]]
+        assert quality["evidence"] and all(e["matched"] for e in quality["evidence"])
+        assert source_paper["title"] in draft_export.text
+        assert source_paper["abstract"][:40] in draft_export.text
+    else:
+        assert draft["plan"]["references"] == [] and quality["evidence"] == []
+        assert "文献" in draft_export.text and "待" in draft_export.text
+    assert tree(h.root) == before_review and len(journey.guidance_calls) == calls
+    assert formal_state(h, pid) == before_plan
+
+    applied = ok(h.client.post(base + f"/suggestions/{draft['suggestion_id']}/apply",
+        json={"expected_revision": workspace(h, pid)["revision"]}))["item"]
+    final = ok(h.client.get(root + "/workspace?include_chat=false"))
+    assert final["workflow"]["flow"]["planReady"] is True
+    assert final["workflow"]["flow"]["plan"]["item_id"] == applied["item_id"]
+    assert {i["kind"] for i in final["workspace"]["items"]} == {"question", "plan"}
+    inventory = ok(h.client.get(root + "/exports"))
+    output = next(e for e in inventory["entries"] if e["key"] == "plan:" + applied["item_id"])
+    before_export = tree(h.root)
+    exported = h.client.get(output["url"])
+    assert exported.status_code == 200 and "当前正式方案" in exported.text
+    assert adopted_question["title"] in exported.text and "待确认" in exported.text
+    if source_paper:
+        assert source_paper["title"] in exported.text and source_paper["abstract"][:40] in exported.text
+    assert tree(h.root) == before_export
+    assert (len(journey.source.calls), len(journey.model_calls)) == retrieval_calls
+    tasks = ok(h.client.get(base + "/research-tasks"))["tasks"]
+    assert [t["task_id"] for t in tasks] == ([task_id] if task_id else [])

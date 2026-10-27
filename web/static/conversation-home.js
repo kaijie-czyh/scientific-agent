@@ -83,7 +83,7 @@
     }
     function fail(v,e){if(!current(v))return;v.error=textError(e);v.r.error.hidden=false;v.r.error.textContent=v.error;}
     function notice(v,text){if(!current(v))return;v.r.error.hidden=!text;v.r.error.textContent=text;}
-    function saveDraft(v){store.set(draftKey(v),{text:v.r.input.value,settings:readSettings(v),entryId:v.entryId ?? null,domain:v.r.domain.value,domainConfirmed:v.domainConfirmed===true,selectedItemId:v.selectedItemId || null,planRequest:v.planRequest || null,planMethod:v.r.planMethod?.value || ""});}
+    function saveDraft(v){store.set(draftKey(v),{text:v.r.input.value,settings:readSettings(v),entryId:v.entryId ?? null,domain:v.r.domain.value,domainConfirmed:v.domainConfirmed===true,selectedItemId:v.selectedItemId || null,paperIds:v.paperIds || [],planRequest:v.planRequest || null,planMethod:v.r.planMethod?.value || ""});}
     function compactName(text,fallback){
         const topic=text.match(/(?:联邦学习|大模型|机器学习|固态电解质|硫化物|量子|机器人|图神经网络)[^，,。！？\n；;]{0,12}/)?.[0];
         const cleaned=(topic || text.replace(/^.*?(?:感兴趣的方向是|研究主题是|研究方向是)[：:]?/,'')) .replace(/\s+/g," ").replace(/^(这是我第一次做研究[，,]?|我目前的研究问题是[：:]?|我想(?:研究|了解|做)|请(?:你|帮我)?(?:检索|搜索|分析|讨论|研究)?|帮我(?:检索|查找|分析))\s*/g,"").split(/[。！？\n]/)[0].split(/[，,；;]|(?:并且|并整理|并分析|想请你|请帮我)/)[0].trim();
@@ -194,7 +194,7 @@
     async function chooseResearchStep(v,id){
         if(!current(v)||v.busy||v.remoteBusy||v.routeBusy)return;
         v.routeBusy=true;paintResearchRoute(v);
-        try{const data=await request(path(v),{method:'PATCH',body:{discussion_step:id}});if(!current(v))return;v.meta=data.conversation;v.discussionStep=id;saveDraft(v);await loadResearchRoute(v);notice(v,'已切换讨论环节，尚未检索、生成或确认任何研究材料。');}
+        try{const data=await request(path(v),{method:'PATCH',body:{discussion_step:id}});if(!current(v))return;v.meta=data.conversation;v.discussionStep=id;saveDraft(v);await loadResearchRoute(v);const choices=v.r.researchRoute.querySelector('.ch-route-details');if(choices)choices.open=false;notice(v,'已切换讨论环节，尚未检索、生成或确认任何研究材料。');}
         catch(e){if(current(v))fail(v,e);}finally{v.routeBusy=false;paintResearchRoute(v);}
     }
     async function loadResearchRoute(v){
@@ -367,7 +367,7 @@
     function paintMessages(v,{initial=false,prepend=false,force=false}={}){
         if(!current(v))return;
         const box=v.r.messages, top=box.scrollTop, height=box.scrollHeight, near=height-top-box.clientHeight<85;
-        const signature=JSON.stringify([v.messages,v.requests,v.material?.papers,v.suggestions,v.busy,v.remoteBusy,v.actionBusy,v.optionSending,v.teachingState]);
+        const signature=JSON.stringify([v.messages,v.requests,v.material?.papers,v.suggestions,v.busy,v.remoteBusy,v.actionBusy,v.optionSending,v.teachingState,Object.values(v.tasks).map(t=>[t.request_id,t.current_version,!!t.report])]);
         if(v.messageSignature===signature && !force && !initial && !prepend)return;
         v.messageSignature=signature;
         v.taskDisplay=v.taskDisplay || new Map();box.querySelectorAll('.ch-task-card').forEach(n=>v.taskDisplay.set(n.dataset.taskId,{open:n.open,details:n.querySelector('.ch-task-diagnostics')?.open,source:n.querySelector('.ch-task-detail')?.open}));
@@ -382,15 +382,17 @@
             if(m.role==="assistant") {const av=E("span","rg-avatar rg-avatar-message");const img=E("img");img.src="/static/assets/research-guide.png";img.alt="";av.append(img);heading.append(av);}
             heading.append(E("strong","",m.role==="user" ? "你" : "科研指导"),E("small","",m.content_source==="teaching_case" ? "案例讲解" : m.mode==="rules" ? "规则指导 · 未调用模型" : m.role==="assistant" ? "基于当前项目材料" : ""));
             const containsPlan=(m.suggestion_ids||[]).some(sid=>v.suggestions.some(s=>s.suggestion_id===sid&&s.plan));
-            if(containsPlan && (v.material?.teaching || m.content.length>600)){card.append(heading,E('p','','方案草案已整理。请打开完整方案核对方法、依据与条件，再决定是否采纳。'));const original=E('details','ch-original-response');original.append(E('summary','','查看原回复与完整说明'),rich(visibleContent(v,m.content)));card.append(original);}else card.append(heading,rich(visibleContent(v,m.content)));
+            const taskDelivery=m.role==='assistant'&&m.request_id&&Object.values(v.tasks).some(t=>t.request_id===m.request_id&&t.report);
+            if(taskDelivery){card.append(heading,E('p','','检索报告已保存，摘要、阅读范围和下一步见上方检索结果。'));const original=E('details','ch-original-response');original.append(E('summary','','查看完整交付说明'),rich(visibleContent(v,m.content)));card.append(original);}
+            else if(containsPlan && (v.material?.teaching || m.content.length>600)){card.append(heading,E('p','','方案草案已整理。请打开完整方案核对方法、依据与条件，再决定是否采纳。'));const original=E('details','ch-original-response');original.append(E('summary','','查看原回复与完整说明'),rich(visibleContent(v,m.content)));card.append(original);}else card.append(heading,rich(visibleContent(v,m.content)));
             if(m.delivery_warnings?.length){const warning=E('details','ch-delivery-warning');warning.append(E('summary','','回答已保存，部分操作未提供'));for(const note of m.delivery_warnings)warning.append(E('p','',note));card.append(warning);}
             for(const sid of m.suggestion_ids || []){const s=v.suggestions.find(s=>s.suggestion_id===sid);if(!s)continue;
                 if(s.kind==="plan" && s.plan)card.append(planPreview(v,s));
                 if(s.kind==="question"){const preview=E("div","ch-proposal-preview");preview.append(E("strong","",s.applied_item_id ? "问题已确认" : "候选研究问题"));const b=button(s.applied_item_id ? "查看已确认问题" : "采用这个问题",()=>s.applied_item_id ? openMaterial(v,"question") : adopt(v,sid));if(v.material?.teaching && !s.applied_item_id)b.dataset.caseOption="adopt_question";b.disabled=!s.applied_item_id && (s.basis_changed!==false || !s.material_fingerprint);preview.append(b);card.append(preview);}
             }
             if(m.role==="assistant" && m.questions?.length){const questions=E("section","ch-guide-questions");questions.setAttribute("aria-label","需要你确认的问题");questions.append(E("small","","需要你确认"));for(const q of m.questions)questions.append(E("p","",q));card.append(questions);}
-            const references=v.material?.teaching && m.cited_paper_ids?.length ? E("details","case-citations") : card;
-            if(references!==card){references.append(E("summary","",`引用资料 · ${m.cited_paper_ids.length} 篇（已准备好）`));card.append(references);}
+            const references=(v.material?.teaching||taskDelivery) && m.cited_paper_ids?.length ? E("details","case-citations") : card;
+            if(references!==card){references.append(E("summary","",taskDelivery?`本轮保存的资料 · ${m.cited_paper_ids.length} 篇（保存不代表纳入综合或已阅读）`:`引用资料 · ${m.cited_paper_ids.length} 篇（已准备好）`));card.append(references);}
             for(const id of m.cited_paper_ids || [])references.append(button(`引用：${v.material?.papers?.find(p=>p.paper_id===id)?.title || '查看来源'}`,()=>openMaterial(v,"papers",id),"ch-citation"));
             if(m.role==="assistant"){
                 const replies=m.suggested_replies || [], actions=m.actions || [];
@@ -815,7 +817,9 @@
     function chooseFile(v){
         if(!current(v))return;
         const input=E('input');input.type='file';input.accept='.pdf,.txt,.md';input.setAttribute('aria-label','选择待上传论文');
+        input.hidden=true;v.root.append(input);input.addEventListener('cancel',()=>input.remove(),{once:true});
         input.onchange=()=>{
+            input.remove();
             if(!input.files.length||!current(v))return;
             const f=input.files[0],old=store.get(fileKey(v));
             // Every selection is new, even the same File, filename or contents.
@@ -839,7 +843,7 @@
         if(previous){
             let state;
             try{state=await request(`/api/projects/${encodeURIComponent(v.pid)}/upload-requests/${encodeURIComponent(previous)}`);}catch(e){if(e.status!==404)throw e;}
-            if(state?.status==='completed'){if(state.paper_id&&!v.paperIds.includes(state.paper_id))v.paperIds.push(state.paper_id);clearUploaded();window.dispatchEvent(new CustomEvent('sra:papers-changed',{detail:{projectId:v.pid}}));return;}
+            if(state?.status==='completed'){if(state.paper_id&&!v.paperIds.includes(state.paper_id))v.paperIds.push(state.paper_id);clearUploaded();notice(v,'资料已保存，可在研究材料核对实际阅读范围。');window.dispatchEvent(new CustomEvent('sra:papers-changed',{detail:{projectId:v.pid}}));return;}
             if(state?.status==='processing')throw new Error('原上传仍在处理，请稍后核对并继续；未重新上传或解析。');
         }
         const fd=new FormData();fd.append('file',f);fd.append('request_id',saved.request_id);
@@ -851,6 +855,7 @@
         clearUploaded();
         window.dispatchEvent(new CustomEvent('sra:papers-changed',{detail:{projectId:v.pid}}));
         if(result.parse_error)notice(v,'资料已保存，但正文未成功解析；后续仅按实际可读范围讨论，可到文献与资料核对。');
+        else notice(v,'资料已保存，可在研究材料核对实际阅读范围。');
     }
     function confirmDomain(v){
         return new Promise(resolve=>{
@@ -953,6 +958,58 @@
         }catch(e){if(e.name!=="AbortError")fail(v,e);}finally{if(current(v))v.r.panel.removeAttribute('aria-busy');}
     }
     /* ---- 第五步：对话驱动的检索任务卡片 ---- */
+    function taskPapers(v,t){
+        const excluded=new Set((t.excluded||[]).map(p=>p.paper_id)),representative=(t.report?.representative||[]).map(p=>p.paper_id);
+        const ids=representative.length?representative:(t.saved_paper_ids||[]);
+        return [...new Set(ids)].filter(id=>!excluded.has(id)).map(id=>v.material?.papers?.find(p=>p.paper_id===id)).filter(Boolean);
+    }
+    async function prepareTaskDiscussion(v,t,step){
+        if(!current(v)||v.busy||v.remoteBusy||v.routeBusy)return;
+        const papers=taskPapers(v,t).slice(0,3);
+        if(!papers.length){notice(v,'本轮尚无可关联的资料，请先打开报告核对或补充论文。');return;}
+        const prompt=(step==='question'?'请结合这批资料和我已有的想法，先讨论可以回答的具体研究问题，给待我确认的候选，不自动采用。':'请带我阅读这批资料，先解释研究对象、方法与局限，并说明对当前方向有什么帮助。')
+            +'\n本次参考：'+papers.map(p=>'《'+p.title+'》').join('、')+'。\n依据是检索时保存的摘要或元信息，请核对当前材料；不将其当作全文或已验证结论。本次不检索或搜索。';
+        if(!await preparePlanInput(v,prompt,null,true)||!current(v))return;
+        v.paperIds=papers.map(p=>p.paper_id);saveDraft(v);await chooseResearchStep(v,step);
+    }
+    function taskResult(v,t){
+        if(!['completed','partial','failed','interrupted','cancelled'].includes(t.status))return null;
+        const report=t.report,box=E('section','ch-task-result'),papers=taskPapers(v,t),included=report?.coverage?.included_count ?? t.included_count;
+        box.append(E('strong','',report?'本轮检索摘要'+(t.current_version?' · v'+t.current_version:''):['completed','partial'].includes(t.status)?'已保存报告的摘要':'本轮整理尚未完成'));
+        const names=new Map((v.material?.papers||[]).map(p=>[p.paper_id,'《'+p.title+'》']));
+        (report?.representative||[]).forEach((p,i)=>{if(!names.has(p.paper_id))names.set(p.paper_id,'资料 '+(i+1));});
+        const readable=text=>{let value=String(text||'');for(const [id,name] of names)value=value.replaceAll(id,name);return value;};
+        const excerpt=(parent,text)=>{const value=readable(text);parent.append(E('p','ch-task-result-summary',value.length>500?value.slice(0,500)+'…':value));if(value.length>500){const full=E('details');full.append(E('summary','','展开完整摘要'),E('p','ch-task-result-summary',value));parent.append(full);}};
+        if(report){
+            if(t.status==='partial')box.append(E('p','ch-warning small','本轮只有部分结果，来源失败或解析不完整；已有可读资料可以继续使用。'));
+            if(!['completed','partial'].includes(t.status))box.append(E('p','ch-warning small','以下是之前保存的报告；本次尝试尚未完成，不代表本次已取得新结果。'));
+            if(t.basis_changed)box.append(E('p','ch-warning small','整理期间项目资料发生变化，请先核对报告和当前材料。'));
+            if(included===0)excerpt(box,(t.candidates_count||0)>0?'本轮返回了资料，但筛选后没有纳入整理。可以查看排除理由，或调整检索范围；这不代表领域没有相关研究。':t.status==='partial'?'本轮没有取得可纳入的资料，且部分来源未成功。请核对来源情况后再决定是否补跑。':'本次查询没有取得可纳入的资料，不代表领域无人研究。可以换一个范围或带入已有论文。');
+            else{
+                if(report.mode==='rules')box.append(E('p','ch-task-result-summary','已整理可供阅读的资料；本报告采用规则汇总，没有完成方法或结论分析。'));
+                if(report.methods_relations)excerpt(box,report.methods_relations);
+                const list=E('ul');for(const entry of (report.representative||[]).slice(0,3)){
+                    const row=E('li'),paper=papers.find(p=>p.paper_id===entry.paper_id);
+                    row.append(paper?button(paper.title,()=>openMaterial(v,'papers',paper.paper_id),'ch-text-button'):E('strong','',names.get(entry.paper_id)));
+                    if(entry.point)excerpt(row,entry.point);list.append(row);
+                }if(list.children.length)box.append(list);
+                if(!report.methods_relations&&!list.children.length)box.append(E('p','ch-task-result-summary','报告已保存，尚无可展示的内容摘要；可打开完整报告核对。'));
+            }
+            const coverage=report.coverage;
+            box.append(E('p','ch-task-result-scope',(coverage?`纳入 ${coverage.included_count} 条；摘要 ${coverage.abstract_count} 条，仅元信息 ${coverage.metadata_only_count} 条。`:'')+(report.evidence_note || '这是检索时保存的资料快照，未核对全文。')));
+            if(report.limitations?.length){const limits=E('details');limits.append(E('summary','','这批资料的局限'));for(const item of report.limitations)excerpt(limits,item.point);box.append(limits);}
+            if([t.planning_note,t.ranking_note,t.synthesis_note].some(Boolean))box.append(E('p','ch-warning small','查询、筛选或整理中有环节使用规则回退，具体说明见检索审计。'));
+        }else box.append(E('p','ch-task-result-summary',!Object.hasOwn(t,'report')?(t._reportError || '正在读取已保存报告的摘要…'):(t.saved_paper_ids?.length?'已保存的资料仍在项目中，可以先阅读；':'')+'尚无成功保存的内容报告，请核对任务状态后再决定是否重试。'));
+        const next=E('div','ch-task-result-next'),locked=v.busy||v.remoteBusy||v.routeBusy;
+        if(t._reportError)next.append(button('重新读取摘要',()=>pollTask(v,t.task_id),'ch-text-button'));
+        if(papers.length&&included!==0&&!t.basis_changed){
+            const read=button('阅读这批资料',()=>prepareTaskDiscussion(v,t,'reading'),'btn btn-secondary');read.disabled=locked;next.append(read);
+            const question=button('讨论研究问题',()=>prepareTaskDiscussion(v,t,'question'),'ch-text-button');question.disabled=locked;next.append(question);
+            box.append(E('p','ch-task-result-scope','下一步只准备可编辑讨论，发送后才处理；最多关联三篇资料，问题与方案仍需你确认。'));
+        }else if(report){next.append(button('核对完整报告',()=>openMaterial(v,'report',t.task_id),'ch-text-button'));}
+        if(report&&included===0){const adjust=button('调整检索范围',()=>startFromCard(v,{content:'按调整后的范围检索相关资料。'},{topic:t.topic}),'ch-text-button');adjust.disabled=locked;next.append(adjust);}
+        box.append(next);return box;
+    }
     function registerTask(v,view){
         if(!view || !view.task_id)return;
         v.tasks[view.task_id]={...v.tasks[view.task_id],...view};
@@ -961,8 +1018,15 @@
     }
     async function pollTask(v,taskId){
         if(!current(v) || !v.tasks[taskId])return;
-        const state=v.tasks[taskId];
+        let state=v.tasks[taskId];
         if(["completed","partial","failed","interrupted","cancelled"].includes(state.status)){
+            if(!Object.hasOwn(state,'report')){
+                if(state._readingReport)return;
+                state._readingReport=true;
+                try{const data=await request(path(v,`/research-tasks/${encodeURIComponent(taskId)}`),{signal:v.reads.signal});if(!current(v))return;state=v.tasks[taskId]={...state,...data,report:data.report ?? null,_reportError:null};}
+                catch(e){if(!current(v)||e.name==='AbortError')return;state._reportError='摘要暂时无法读取，已有报告和资料保留；可重新读取，不会重跑检索。';paintTasks(v);return;}
+                finally{state._readingReport=false;}
+            }
             if(!state._settled){state._settled=true;paintTasks(v);await newMessages(v).catch(()=>{});await refreshMaterials(v).catch(()=>{});}
             return;
         }
@@ -984,7 +1048,7 @@
         const failLabel={proxy_error:"代理连接失败",timeout:"来源超时",rate_limited:"限流，请等待后重试",authentication:"认证失败",access_denied:"来源拒绝访问",parse_error:"来源内容无法解析",budget_exhausted:"本次调用上限已达到",auth_or_blocked:"认证或拦截",network:"网络不可达",unknown:"未知错误"};
         for(const t of tasks){
             const card=E("details","ch-task-card");card.dataset.taskId=t.task_id;
-            card.open=previous.get(t.task_id)?.open ?? ["running","queued"].includes(t.status);
+            card.open=previous.get(t.task_id)?.open ?? (["running","queued"].includes(t.status)||t===tasks.at(-1));
             const failed=t.failed_sources?.length ? ` · 失败来源：${t.failed_sources.join("、")}` : "";
             card.append(E("summary","",`文献检索：${t.topic} · ${t.status_label}${failed}`));
             const body=E("details","ch-task-body ch-task-diagnostics");body.open=previous.get(t.task_id)?.details || false;body.append(E('summary','','范围、来源与调用详情'));
@@ -1017,7 +1081,7 @@
             for(const ver of versions.slice(0,-1))controls.append(button(`下载 v${ver.version}`,()=>{window.open(BASE+`/api/projects/${encodeURIComponent(v.pid)}/research-tasks/${encodeURIComponent(t.task_id)}/export?version=${ver.version}`,"_blank");},"ch-text-button"));
             body.append(E("p","muted small","候选、入库和纳入综合含义不同；正式问题和方案仍需你确认。"));
             const compact=E('p','ch-task-compact',(['completed','partial'].includes(t.status)?`已保存 ${t.saved_papers_count ?? 0} 篇资料；纳入 ${t.included_count ?? 0}，筛选排除 ${t.excluded_count ?? 0}。`:t.status==='failed'?'整理未完成；已保存资料保留，可查看原因后重试。':({planning:'正在规划查询',searching:'正在请求文献来源',ranking:'正在筛选候选',saving:'正在保存资料',synthesizing:'正在整理研究现状',delivering:'正在保存报告'})[t.stage] || t.status_label));
-            card.append(compact,controls,body);
+            card.append(compact);const result=taskResult(v,t);if(result)card.append(result);card.append(controls,body);
             const user=v.r.messages.querySelector(`[data-request-id="${CSS.escape(t.request_id || '')}"]`);
             // Completed tasks must remain discoverable even when their original
             // user message is outside the currently loaded history page.
@@ -1109,7 +1173,7 @@
         const v=g.v={root,r,pid:projectId,cid:conversationId,meta:null,material:null,messages:[],requests:{},paperIds:[],suggestions:[],suggestionOffset:null,before:null,reads:new AbortController(),busy:false,remoteBusy:false,writable:false,accepted:new Set(),tasks:{},taskTimer:null};
         window.SRA_TEACHING?.attach({v,E,button,current,request,app:g.app,refreshMessages:()=>pageMessages(v,{replace:true}),refreshMaterials:()=>refreshMaterials(v),repaint:()=>paintMessages(v),openMaterial:(kind,id)=>openMaterial(v,kind,id),adopt:sid=>adopt(v,sid),closeMaterials:()=>panel(v,false),notice,fail});
         const taskBox=E("div","ch-task-box");taskBox.dataset.ref="taskBox";taskBox.hidden=true;taskBox.setAttribute("role","status");taskBox.setAttribute("aria-label","文献检索任务");r.messages.append(taskBox);r.taskBox=taskBox;
-        const draft=store.get(draftKey(v),{});v.entryId=Number.isInteger(draft.entryId)&&ENTRY_PATHS[draft.entryId]?draft.entryId:null;v.domainConfirmed=draft.domainConfirmed===true;v.selectedItemId=draft.selectedItemId || null;v.planRequest=draft.planRequest || null;r.planMethod.value=draft.planMethod || "";r.input.value=draft.text || "";setSettings(v,draft.settings || {});v.startPending=!v.cid && !!store.get("sra.ch.start."+scope(v.pid,null));paintEntry(v);
+        const draft=store.get(draftKey(v),{});v.entryId=Number.isInteger(draft.entryId)&&ENTRY_PATHS[draft.entryId]?draft.entryId:null;v.domainConfirmed=draft.domainConfirmed===true;v.selectedItemId=draft.selectedItemId || null;v.paperIds=Array.isArray(draft.paperIds)?draft.paperIds.filter(id=>typeof id==='string').slice(0,3):[];v.planRequest=draft.planRequest || null;r.planMethod.value=draft.planMethod || "";r.input.value=draft.text || "";setSettings(v,draft.settings || {});v.startPending=!v.cid && !!store.get("sra.ch.start."+scope(v.pid,null));paintEntry(v);
         r.preparePlan.onclick=()=>preparePlanInput(v,"请为所选研究问题生成一份研究方案，具体要求：",{method:r.planMethod.value || null,question_id:r.planQuestion.value || null,supersedes_id:v.planRequest?.supersedes_id || null});
         if(v.planRequest)r.planPending.textContent="已恢复待发送的方案请求；尚未调用模型，可继续编辑。";
         r.planMethod.onchange=()=>{if(v.planRequest)v.planRequest.method=r.planMethod.value || null;saveDraft(v);};r.cancelPlan.onclick=()=>{v.planRequest=null;r.planPending.textContent="已清除附加的类型和修订信息，草稿保留；如果文字仍要求生成方案，请先修改文字再发送。";saveDraft(v);};

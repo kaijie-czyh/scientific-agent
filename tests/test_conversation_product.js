@@ -52,8 +52,10 @@ const functions = [
     source.slice(source.indexOf('    async function refreshMaterials('), source.indexOf('    async function downloads(')),
     source.slice(source.indexOf('    async function firstSend('), source.indexOf('    async function retry(')),
     source.slice(source.indexOf('    async function chooseReply('), source.indexOf('    async function runAction(')),
+    source.slice(source.indexOf('    function taskPapers('), source.indexOf('    function registerTask(')),
+    source.slice(source.indexOf('    async function pollTask('), source.indexOf('    function paintTasks(')),
 ].join('\n');
-vm.runInContext(functions + '\nthis.controllers={runtimeBlocked,allowGeneration,loadRuntime,planQuality,preparePlanInput,prepareSearchInput,refreshMaterials,firstSend,chooseReply,selectEntry,journeyNext,runJourneyNext};', context);
+vm.runInContext(functions + '\nthis.controllers={runtimeBlocked,allowGeneration,loadRuntime,planQuality,preparePlanInput,prepareSearchInput,refreshMaterials,firstSend,chooseReply,selectEntry,journeyNext,runJourneyNext,taskPapers,taskResult,prepareTaskDiscussion,pollTask};', context);
 // paintHeader belongs to the full app; the tested refresh must call it without
 // navigating, generating, or depending on unrelated project-list DOM.
 context.paintHeader = () => {};
@@ -119,6 +121,26 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
     recovering=c.runJourneyNext(recovery,{action:'question'},design);await flush();find(recovery.root,'保留并追加').onclick();await recovering;
     assert.equal(recovery.discussionStep,'question','confirmed question recovery must discuss the question instead of staying in blocked design');
     assert.match(recovery.r.input.value,/^我的研究问题是/);assert.match(recovery.r.input.value,/本次不生成或修订方案。$/);
+    const resultView=view();resultView.material={papers:[{paper_id:'source-id-1',title:'可阅读的论文'},{paper_id:'excluded-id',title:'被筛除的资料'}]};
+    const resultTask={task_id:'task1',status:'completed',current_version:1,included_count:1,saved_paper_ids:['source-id-1','excluded-id'],excluded:[{paper_id:'excluded-id'}],report:{mode:'model',methods_relations:'只依据 source-id-1 的摘要比较方法。',representative:[{paper_id:'source-id-1',point:'方法条件仍待核实。'}],coverage:{included_count:1,abstract_count:1,metadata_only_count:0}}};
+    assert.equal(c.taskResult(resultView,{status:'running'}),null);
+    const result=c.taskResult(resultView,resultTask);
+    assert.match(result.textContent,/本轮检索摘要 · v1/);assert.match(result.textContent,/《可阅读的论文》/);assert.match(result.textContent,/摘要 1 条/);assert.match(result.textContent,/未核对全文/);
+    assert.doesNotMatch(result.textContent,/source-id-1|被筛除的资料/);
+    assert.equal(c.taskPapers(resultView,{...resultTask,report:null}).length,1,'saved but excluded papers are never offered as the reading batch');
+    const partial=c.taskResult(resultView,{...resultTask,status:'partial',synthesis_note:'rule fallback',report:{...resultTask.report,mode:'rules'}});
+    assert.match(partial.textContent,/部分结果/);assert.match(partial.textContent,/没有完成方法或结论分析/);assert.match(partial.textContent,/规则回退/);
+    const zero=c.taskResult(resultView,{...resultTask,included_count:0,candidates_count:3,report:{...resultTask.report,coverage:{included_count:0,abstract_count:0,metadata_only_count:0},representative:[],methods_relations:''}});
+    assert.match(zero.textContent,/筛选后没有纳入/);assert.match(zero.textContent,/不代表领域没有/);assert.equal(find(zero,'阅读这批资料'),undefined);
+    assert.match(c.taskResult(resultView,{status:'failed',report:null,saved_paper_ids:[]}).textContent,/尚无成功保存的内容报告/);
+    assert.equal(find(c.taskResult(resultView,{...resultTask,basis_changed:true}),'阅读这批资料'),undefined,'known changed basis must be reviewed before continuing');
+    assert.match(c.taskResult(resultView,{...resultTask,report:{...resultTask.report,methods_relations:'原始长摘要'.repeat(200)}}).textContent,/展开完整摘要/);
+    const beforeReport=calls.length;resultView.r.input.value='先保留我的疑问';resultView.planRequest={question_id:'old'};resultView.paperIds=['old-paper'];resultView.discussionStep='conditions';
+    let reading=c.prepareTaskDiscussion(resultView,resultTask,'reading');await flush();find(resultView.root,'保留草稿，暂不追加').onclick();await reading;
+    assert.equal(resultView.r.input.value,'先保留我的疑问');assert.deepEqual(resultView.paperIds,['old-paper']);assert.equal(resultView.discussionStep,'conditions');assert.ok(resultView.planRequest);
+    reading=c.prepareTaskDiscussion(resultView,resultTask,'reading');await flush();find(resultView.root,'保留并追加').onclick();await reading;
+    assert.equal(resultView.discussionStep,'reading');assert.deepEqual(Array.from(resultView.paperIds),['source-id-1']);assert.equal(resultView.planRequest,null);assert.match(resultView.r.input.value,/^先保留我的疑问/);assert.match(resultView.r.input.value,/本次不检索或搜索/);
+    assert.equal(calls.length,beforeReport,'result continuation only prepares editable text, never sends or searches');
     let v = view();
     v.runtime = {mode: 'rules', status: 'rules_mode', checks: [{status: 'missing_credentials'}]};
     assert.equal(await c.allowGeneration(v), true, 'missing model credentials cannot block rule guidance');
@@ -281,5 +303,16 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
     assert.match(quality.textContent, /1 mS\/cm/, 'failed refresh retains the previous report');
     assert.equal(find(quality, '重新核对').disabled, false, 'retry remains actionable after failure');
     assert.ok(calls.every(call => call.options.method === undefined), 'all review and readiness operations must stay read-only');
+    context.path=(v,suffix)=>'/saved-conversation'+suffix;context.paintTasks=()=>{};context.newMessages=async()=>{};context.refreshMaterials=async()=>{};
+    const restored=view();restored.tasks={t1:{task_id:'t1',status:'completed'}};
+    failure=null;response={task_id:'t1',status:'completed',report:{mode:'rules',representative:[]}};
+    const beforeRestore=calls.length;await c.pollTask(restored,'t1');await c.pollTask(restored,'t1');
+    assert.equal(calls.length,beforeRestore+1,'restoring a terminal task reads its exact saved report once');
+    assert.equal(restored.tasks.t1.report.mode,'rules');assert.ok(restored.tasks.t1._settled);
+    restored.tasks.t2={task_id:'t2',status:'partial'};failure=new Error('read unavailable');await c.pollTask(restored,'t2');
+    assert.match(restored.tasks.t2._reportError,/不会重跑检索/);assert.equal(restored.tasks.t2._readingReport,false);
+    failure=null;response={task_id:'t2',status:'partial',report:{mode:'model',representative:[]}};await c.pollTask(restored,'t2');
+    assert.equal(restored.tasks.t2._reportError,null);assert.equal(restored.tasks.t2.report.mode,'model');
+    assert.ok(calls.slice(beforeRestore).every(call=>call.options.method===undefined&&/research-tasks\/t[12]$/.test(call.url)),'summary restore and retry never call a search or generation endpoint');
     console.log('Conversation product behavior checks passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
