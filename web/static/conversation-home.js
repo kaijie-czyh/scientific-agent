@@ -83,7 +83,7 @@
     }
     function fail(v,e){if(!current(v))return;v.error=textError(e);v.r.error.hidden=false;v.r.error.textContent=v.error;}
     function notice(v,text){if(!current(v))return;v.r.error.hidden=!text;v.r.error.textContent=text;}
-    function saveDraft(v){store.set(draftKey(v),{text:v.r.input.value,settings:readSettings(v),domain:v.r.domain.value,domainConfirmed:v.domainConfirmed===true,selectedItemId:v.selectedItemId || null,planRequest:v.planRequest || null,planMethod:v.r.planMethod?.value || ""});}
+    function saveDraft(v){store.set(draftKey(v),{text:v.r.input.value,settings:readSettings(v),entryId:v.entryId ?? null,domain:v.r.domain.value,domainConfirmed:v.domainConfirmed===true,selectedItemId:v.selectedItemId || null,planRequest:v.planRequest || null,planMethod:v.r.planMethod?.value || ""});}
     function compactName(text,fallback){
         const topic=text.match(/(?:联邦学习|大模型|机器学习|固态电解质|硫化物|量子|机器人|图神经网络)[^，,。！？\n；;]{0,12}/)?.[0];
         const cleaned=(topic || text.replace(/^.*?(?:感兴趣的方向是|研究主题是|研究方向是)[：:]?/,'')) .replace(/\s+/g," ").replace(/^(这是我第一次做研究[，,]?|我目前的研究问题是[：:]?|我想(?:研究|了解|做)|请(?:你|帮我)?(?:检索|搜索|分析|讨论|研究)?|帮我(?:检索|查找|分析))\s*/g,"").split(/[。！？\n]/)[0].split(/[，,；;]|(?:并且|并整理|并分析|想请你|请帮我)/)[0].trim();
@@ -110,21 +110,86 @@
     function readSettings(v){return {guidance_mode:v.r.mode.value,entry_stage:v.r.stage.value,discussion_goal:v.r.goal.value,...(v.discussionStep ? {discussion_step:v.discussionStep} : {})};}
     function setSettings(v,s){v.r.mode.value=s.guidance_mode || "direct";v.r.stage.value=s.entry_stage || "orientation";v.r.goal.value=s.discussion_goal || "";v.discussionStep=s.discussion_step || null;}
 
+    const ENTRY_PATHS=[
+        {title:'第一次做研究',outcome:'从兴趣中找到两三个可继续了解的切入点。',need:'说一个感兴趣的现象或应用；不知道专业术语也可以。',mode:'beginner',stage:'orientation',step:'conditions',goal:'找到适合继续了解的研究切入点',prompt:'这是我第一次做研究，我感兴趣的现象或方向是：\n请先帮我缩小范围，用容易理解的方式讨论可研究的切入点。'},
+        {title:'已经有研究方向',outcome:'比较可研究的切入点，明确还需要哪些资料。',need:'说出方向和这次想解决的困难；已有条件可以直接补充。',mode:'direct',stage:'literature',step:'exploration',goal:'比较研究切入点并明确需要的资料',prompt:'我想围绕这个方向找研究切入点：\n请结合已有思路和需要补充的资料，和我一起收窄问题。'},
+        {title:'已经有研究问题',outcome:'先确认一句具体问题，再围绕它完善方案。',need:'贴出已有问题或方案想法；不需要重新从兴趣开始。',mode:'direct',stage:'question',step:'question',goal:'明确已有研究问题并讨论验证思路',prompt:'我目前的研究问题是：\n请先帮我核对问题是否具体、可以怎样验证，并整理成待我确认的问题；确认后再讨论方案。'},
+        {title:'带着论文来阅读',outcome:'读懂论文在解决什么、怎么做，以及对你的研究有什么帮助。',need:'选择 PDF、TXT、MD，或直接粘贴希望讨论的段落。',mode:'direct',stage:'literature',step:'reading',goal:'读懂已有论文并整理阅读重点',prompt:'我手上有一篇论文，希望先读懂研究问题、方法与局限，再整理阅读重点。\n我最想弄清楚的是：'},
+    ];
+    function paintEntry(v){
+        const entry=ENTRY_PATHS[v.entryId];v.r.entryGuide.hidden=!entry;
+        v.root.querySelectorAll('[data-entry]').forEach(b=>b.setAttribute('aria-pressed',String(Number(b.dataset.entry)===v.entryId)));
+        if(!entry)return;
+        v.r.entryTitle.textContent=entry.title;v.r.entryOutcome.textContent='这次可以得到：'+entry.outcome;v.r.entryNeed.textContent=entry.need;
+        v.r.entryUpload.hidden=v.entryId!==3;
+    }
+    async function selectEntry(v,id){
+        const entry=ENTRY_PATHS[id];if(!entry||!current(v)||v.entryChanging||v.busy||v.remoteBusy)return;
+        if(v.entryId===id){v.r.input.focus();return;}
+        v.entryChanging=true;
+        try{
+            const previous=ENTRY_PATHS[v.entryId],scaffold=previous&&v.r.input.value.trim()===previous.prompt;
+            if((v.r.input.value.trim()&&!scaffold)||v.planRequest){if(!await preparePlanInput(v,entry.prompt+'\n\n本次先按新起点讨论，暂不检索或搜索。',null,true))return;}
+            else{v.r.input.value=entry.prompt;v.r.input.dispatchEvent(new Event('input'));}
+            if(!current(v))return;
+            v.entryId=id;v.r.mode.value=entry.mode;v.r.stage.value=entry.stage;v.discussionStep=entry.step;v.r.goal.value=entry.goal;
+            saveDraft(v);paintEntry(v);v.r.input.focus();
+        }finally{v.entryChanging=false;}
+    }
+    const STEP_LABELS={conditions:'明确研究方向',exploration:'比较研究切入点',reading:'阅读与准备资料',synthesis:'梳理研究现状',question:'确认研究问题',design:'完善研究方案'};
+    function journeyNext(v,selected){
+        if(v.researchRoute?.step==='paused')return {title:'当前讨论已暂停',outcome:'已有内容会保留；准备继续时，可以直接输入新的要求。',label:'回到输入框',action:'focus'};
+        const flow=v.material?.workflow?.flow,proposals=(v.suggestions||[]).filter(s=>!s.applied_item_id&&s.basis_changed===false&&s.material_fingerprint);
+        const pendingPlan=selected.id==='design'&&!flow?.question?.needs_review&&flow?.question?.item_id&&proposals.find(s=>s.kind==='plan'&&s.plan?.question_id===flow.question.item_id);
+        if(pendingPlan)return {title:'方案草案已准备好',outcome:'先审阅这份草案，再决定是否替换或补充已保存的方案。',label:'审阅方案草案',action:'proposal',id:pendingPlan.suggestion_id};
+        if(selected.id==='design'&&flow?.plan){return {title:'继续完善你的方案',outcome:flow.plan.needs_review?'资料有变化，先核对后再修改或导出。':'已有正式方案，可以继续审阅、修改或带走。',label:'打开当前方案',action:'plan',id:flow.plan.item_id};}
+        if(['question','design'].includes(selected.id)){
+            const proposal=proposals.find(s=>s.kind===(selected.id==='design'?'plan':'question')) || proposals.find(s=>s.kind==='question');
+            if(proposal)return {title:proposal.kind==='plan'?'方案草案已准备好':'有一个问题等待你确认',outcome:'打开后核对内容，再决定是否采用。',label:proposal.kind==='plan'?'审阅方案草案':'查看待确认问题',action:'proposal',id:proposal.suggestion_id};
+        }
+        if(['question','design'].includes(selected.id)&&flow?.question?.needs_review)return {title:'先核对研究问题的依据',outcome:'已有问题或来源发生变化，核对后再继续方案。',label:'核对当前问题',action:'overview'};
+        if(selected.id==='question'&&flow?.question)return {title:'研究问题已确认',outcome:'可以直接围绕当前问题讨论方法、对照与可行性。',label:'围绕这个问题设计方案',action:'design'};
+        if(selected.id==='design'&&selected.blocked_reason){return {title:'先明确这份方案要回答的问题',outcome:selected.blocked_reason,label:'准备问题确认',action:'question'};}
+        if((selected.id==='reading'&&selected.action==='search')||(['synthesis','question'].includes(selected.id)&&selected.blocked_reason)){
+            return {title:'先准备一份可以阅读的资料',outcome:'带来已有论文，或先明确要查找的内容，再继续讨论。',label:'添加已有论文',action:'upload',secondary:selected.action==='search'?'查找相关论文':'讨论检索需求'};
+        }
+        const outcomes={conditions:'把兴趣和已知条件说清楚，未知的部分可以留待后续补充。',exploration:'比较少量切入点，先看哪一个值得继续了解。',reading:'围绕已有资料解释问题、方法与局限，整理阅读重点。',synthesis:'把已有工作与待核实的差异整理清楚。',question:flow?.question?'已有正式问题，可以继续细化范围或准备方案。':'把已有想法收窄成一句待你确认的问题。',design:'围绕已确认问题，准备方法、对照与可行性讨论。'};
+        return {title:STEP_LABELS[selected.id],outcome:outcomes[selected.id],label:selected.action_label,action:'step'};
+    }
+    async function runJourneyNext(v,next,selected){
+        if(!current(v)||v.busy||v.remoteBusy||v.routeBusy)return;
+        if(next.action==='plan')return openMaterial(v,'record',next.id);
+        if(next.action==='proposal')return openMaterial(v,'proposal',next.id);
+        if(next.action==='upload')return v.r.import.click();
+        if(next.action==='focus')return v.r.input.focus();
+        if(next.action==='overview')return openMaterial(v,'overview');
+        if(next.action==='design'){await chooseResearchStep(v,'design');if(current(v)){const step=v.researchRoute?.steps.find(s=>s.id==='design');if(step&&!step.blocked_reason)return beginResearchStep(v,step);}return;}
+        if(next.action==='question'){
+            if(await preparePlanInput(v,'请把我已经提供的研究问题整理成一句具体、可讨论验证方法的问题，先给待我确认的候选；不要自动采用或生成方案。',null,true)&&current(v))await chooseResearchStep(v,'question');
+            return;
+        }
+        return beginResearchStep(v,selected);
+    }
+
     function paintResearchRoute(v){
         if(!current(v))return;
         const box=v.r.researchRoute;box.hidden=!v.cid || !v.researchRoute || !!v.material?.teaching;
         if(box.hidden)return;
         const route=v.researchRoute,selected=route.steps.find(s=>s.id===route.discussion_step);
-        const signature=JSON.stringify([route,v.busy,v.remoteBusy,v.routeBusy]);if(v.routeSignature===signature)return;v.routeSignature=signature;
+        const signature=JSON.stringify([route,v.material?.workflow?.flow,(v.suggestions||[]).map(s=>[s.suggestion_id,s.applied_item_id,s.basis_changed]),v.busy,v.remoteBusy,v.routeBusy]);if(v.routeSignature===signature)return;v.routeSignature=signature;
         const open=box.querySelector('details')?.open || false;box.replaceChildren();
+        if(selected){const next=journeyNext(v,selected),row=E('div','ch-journey-next'),copy=E('div'),actions=E('div','ch-journey-actions');
+            copy.append(E('strong','',next.title),E('p','',next.outcome));
+            const action=button(next.label,()=>runJourneyNext(v,next,selected),'btn btn-secondary');action.dataset.ref='beginResearchStep';action.disabled=v.busy||v.remoteBusy||v.routeBusy;actions.append(action);
+            if(next.secondary){const extra=button(next.secondary,()=>selected.action==='search'?beginResearchStep(v,selected):preparePlanInput(v,'请根据我们正在讨论的方向，先明确需要查找哪些论文和资料；这次只讨论检索需求。',null,true),'ch-text-button');extra.disabled=action.disabled;actions.append(extra);}
+            row.append(copy,actions);box.append(row);
+        }
         const details=E('details','ch-route-details');details.open=open;
-        details.append(E('summary','',`科研流程 · ${selected?.label || '选择讨论步骤'}`));
+        details.append(E('summary','','更换当前任务'));
         const choices=E('div','ch-route-choices');choices.setAttribute('aria-label','选择本次科研讨论步骤');
-        for(const s of route.steps){const b=button(s.label,()=>chooseResearchStep(v,s.id),'ch-text-button');b.dataset.researchStep=s.id;b.setAttribute('aria-pressed',String(s.id===route.discussion_step));b.disabled=v.busy||v.remoteBusy||v.routeBusy;choices.append(b);}
+        for(const s of route.steps){const b=button(STEP_LABELS[s.id]||s.label,()=>chooseResearchStep(v,s.id),'ch-text-button');b.dataset.researchStep=s.id;b.setAttribute('aria-pressed',String(s.id===route.discussion_step));b.disabled=v.busy||v.remoteBusy||v.routeBusy;choices.append(b);}
         details.append(choices,E('p','muted small',route.notice));box.append(details);
-        if(selected){const row=E('div','ch-route-current');row.append(E('span','muted small',selected.blocked_reason || selected.purpose));
-            const action=button(selected.action_label,()=>beginResearchStep(v,selected),'btn btn-secondary');action.dataset.ref='beginResearchStep';action.disabled=!!selected.blocked_reason||v.busy||v.remoteBusy||v.routeBusy;row.append(action);box.append(row);
-            if(route.next_step){const next=button('讨论好了，'+(route.next_step.label.startsWith('开始')?'':'进入')+route.next_step.label,()=>chooseResearchStep(v,route.next_step.id),'ch-text-button ch-route-next');next.title=route.next_step.blocked_reason || '只切换讨论环节，不自动执行任务或确认材料';next.disabled=!!route.next_step.blocked_reason||v.busy||v.remoteBusy||v.routeBusy;box.append(next);}}
+        if(route.next_step){const next=button('下一环节：'+(STEP_LABELS[route.next_step.id]||route.next_step.label),()=>chooseResearchStep(v,route.next_step.id),'ch-text-button ch-route-next');next.title=route.next_step.blocked_reason || '只切换任务，不自动执行或确认材料';next.disabled=!!route.next_step.blocked_reason||v.busy||v.remoteBusy||v.routeBusy;details.append(next);}
     }
     async function chooseResearchStep(v,id){
         if(!current(v)||v.busy||v.remoteBusy||v.routeBusy)return;
@@ -169,7 +234,7 @@
         const branch=flow?.flow, boundary=v.material?.product_boundary || flow?.product_boundary;
         const contextHint=boundary?.restricted ? "该历史项目的后续执行受限，已有材料仍可查看、导出；本轮只讨论问题与研究方案。" : branch?.next?.action==="revise" || boundary?.reason==="review_required" ? "问题、方案或来源需要复核，先核对变化，不直接认定方案就绪。" : branch?.planReady ? "方案已可审阅；可以讨论修改或导出，不代表结论得到验证。" : !v.material?.papers?.length ? "尚无可用论文材料，先讨论兴趣或需补充的证据；尚未完成文献检索。" : flow?.continuation?.hint || "可以结合本项目已有材料继续讨论。";
         if(v.pid && !v.cid){v.r.welcome.hidden=true;v.r.summaryText.textContent=branch?.question ? (branch.question.needs_review?'待复核问题：':'已确认问题：')+branch.question.title : '选择一段已有对话继续，或在下方开始新讨论。首次发送才保存新会话。';}
-        v.r.continueHint.hidden=!v.cid || !v.messages.length;
+        v.r.continueHint.hidden=!v.cid || !v.messages.length || (!!v.researchRoute&&!v.material?.teaching);
         v.r.continueHint.textContent=contextHint;
         const stages=['明确条件','了解研究现状','确认研究问题','形成并审阅方案'],currentStage=({orientation:0,literature:1,question:2,design:3})[flow?.product_stage] ?? 0;
         [...v.r.stageList.children].forEach((n,i)=>{n.textContent=stages[i];if(i===currentStage)n.setAttribute('aria-current','step');else n.removeAttribute('aria-current');});
@@ -1009,13 +1074,13 @@
         const root=E("section","conversation-home");root.setAttribute("aria-label","中央科研对话");
         root.innerHTML=`<div class="ch-shell"><div class="ch-center">
           <header class="ch-heading"><div><div class="ch-project-line"><button type="button" class="ch-text-button" data-ref="project" aria-label="查看所属项目">开始新研究</button></div><h1 data-ref="title" tabindex="0">新对话</h1><button type="button" data-ref="progress" class="ch-stage ch-text-button">明确条件</button></div><div class="ch-heading-actions"><button class="btn btn-secondary" type="button" data-ref="panelToggle" aria-expanded="false">研究材料</button><details class="ch-title-menu"><summary aria-label="项目与对话操作">⋯</summary><div><button type="button" data-ref="renameProject" class="ch-text-button" hidden>修改项目名</button><button class="ch-text-button" type="button" data-ref="rename" hidden>重命名对话</button><button class="ch-text-button" type="button" data-ref="identity">查看与复制项目编号</button><button type="button" data-ref="relationship" class="ch-text-button">项目与对话有什么不同？</button><small data-ref="fullName" hidden></small></div></details></div></header>
-          <div data-ref="welcome" class="ch-welcome"><span class="ch-eyebrow">SCIENTIFIC RESEARCH · HUMAN + AGENT</span><h2>从一个兴趣，到一份清晰的研究方案</h2><p>你好，我会和你一起把研究兴趣整理成清晰的问题，再形成有文献依据的研究方案。<br>你可以从零开始，也可以带着已有方向、论文或想法继续。</p><div class="ch-openers"><button type="button" data-entry="0">第一次做研究，带我入门。<span>从兴趣和当前条件出发</span></button><button type="button" data-entry="1">我有方向，想了解研究现状。<span>梳理文献，明确已有工作</span></button><button type="button" data-entry="2">我有研究问题，想设计或完善方案。<span>讨论对照、指标与可行性</span></button></div><small>案例体验尚未接入。本轮不执行实验，也不生成论文或科研结论。</small></div>
+          <div data-ref="welcome" class="ch-welcome"><span class="ch-eyebrow">SCIENTIFIC RESEARCH · HUMAN + AGENT</span><h2>从你现在的研究进度开始</h2><p>一起找方向、读论文、明确问题，再形成一份可以审阅和带走的研究方案。<br>选一个起点，或直接说说你现在想解决什么。</p><div class="ch-openers" aria-label="选择研究起点"><button type="button" data-entry="0" aria-pressed="false">第一次做研究，带我入门<span>从一个兴趣，找到可以继续了解的切入点</span></button><button type="button" data-entry="1" aria-pressed="false">我有方向，想找研究切入点<span>比较思路，明确需要补充哪些资料</span></button><button type="button" data-entry="3" aria-pressed="false">我有论文，想先读懂<span>围绕论文解释问题、方法与局限</span></button><button type="button" data-entry="2" aria-pressed="false">我有问题，想完善研究方案<span>先确认具体问题，再讨论怎样验证</span></button></div><section class="ch-entry-guide" data-ref="entryGuide" aria-live="polite" hidden><strong data-ref="entryTitle"></strong><p data-ref="entryOutcome"></p><p data-ref="entryNeed"></p><button type="button" class="ch-text-button" data-ref="entryUpload" hidden>选择论文</button></section><small>还不确定怎么开始？可以先体验一个完整案例。</small></div>
           <div class="ch-history-tools"><button type="button" class="ch-text-button" data-ref="earlier" hidden>加载更早消息</button><button type="button" class="ch-text-button" data-ref="latest" hidden>查看最新消息 ↓</button><span data-ref="loading" role="status">正在核对会话能力…</span></div>
           <div class="ch-messages" data-ref="messages" role="log" aria-label="当前会话消息" aria-live="polite" tabindex="0"></div>
           <form data-ref="form" class="ch-compose"><div class="ch-error" data-ref="error" role="status" hidden></div><label class="rg-sr-only" for="ch-input">向科研指导提问</label><textarea id="ch-input" data-ref="input" rows="2" maxlength="6000" placeholder="说说你的研究兴趣、已有想法，或当前遇到的问题…"></textarea><div class="ch-compose-footer"><div class="ch-compose-tools"><button type="button" class="ch-text-button" data-ref="import" title="导入／查看论文">＋ 资料</button><details class="ch-settings"><summary>讨论设置</summary><div class="ch-settings-grid"><label><span data-ref="belongsLabel">首次发送后归入</span><select data-ref="belongs" aria-label="对话归属"><option value="">＋ 开始新研究</option></select></label><label data-ref="domainWrap">研究领域<select data-ref="domain" aria-label="研究领域"><option value="">尚未确定 · 请确认</option></select></label><label>指导方式<select data-ref="mode" aria-label="指导方式"><option value="beginner">带我入门</option><option value="direct">直接处理问题</option><option value="case" disabled>教学设置（案例内固定）</option></select></label><label>进入阶段<select data-ref="stage" aria-label="进入阶段"><option value="orientation">明确条件</option><option value="literature">了解研究现状</option><option value="question">确认研究问题</option><option value="design">形成并审阅方案</option></select></label><label class="ch-goal">讨论目标<input data-ref="goal" aria-label="讨论目标" maxlength="2000" placeholder="例如：明确研究问题的范围" /></label><p class="muted small">设置不改变正式研究主线。新研究的领域需由你确认。</p><button type="button" class="btn btn-secondary" data-ref="saveSettings">保存讨论设置</button></div></details></div><span data-ref="composeScope" class="ch-compose-scope"></span><button type="submit" class="btn" data-ref="send" disabled>发送</button></div></form>
         </div><aside data-ref="panel" class="ch-material-panel" aria-label="当前项目研究材料" hidden><div class="ch-panel-header"><h2>研究材料</h2><button type="button" data-ref="panelWide" class="btn btn-secondary">扩大阅读</button><button type="button" data-ref="panelClose" class="btn btn-secondary">返回对话</button><div class="ch-material-tabs" data-ref="materialTabs" role="tablist" aria-label="研究材料分类"></div></div><div class="ch-material-scroll" data-ref="materialScroll" tabindex="0"><div data-ref="researchSummary" class="ch-overview" data-material-group="overview"><h3>研究概况</h3><p data-ref="confirmedQuestion"></p><p data-ref="confirmedBrief"></p><p data-ref="summaryHint"></p><button type="button" class="ch-text-button" data-ref="pendingItems">查看待确认事项</button><details class="ch-overview-stages"><summary>四阶段与正式材料状态</summary><ol data-ref="stageList"><li></li><li></li><li></li><li></li></ol><p>当前阶段来自已保存材料；讨论入口不代表前面步骤已完成。流程止于研究方案，不执行实验。</p></details></div><div data-ref="materialBody"></div><button type="button" class="ch-text-button" data-ref="refresh">刷新材料与草案</button></div></aside></div>`;
         const actions=root.querySelector('.ch-heading-actions');
-        root.querySelector('.ch-welcome p').after(E('p','ch-first-send-note','直接输入或先选论文，首次发送后才建立独立项目。'));
+        root.querySelector('.ch-welcome p').after(E('p','ch-first-send-note','选好起点后，输入内容并发送即可开始；也可以先选论文。'));
         const runtime=E('section','ch-runtime');runtime.dataset.ref='runtime';runtime.setAttribute('aria-label','运行配置与离线体验');runtime.setAttribute('role','status');root.querySelector('.ch-compose').prepend(runtime);
         const planTools=E("details","ch-plan-tools");planTools.dataset.ref="planTools";planTools.hidden=true;
         planTools.innerHTML='<summary>方案生成与审阅</summary><label>研究问题<select data-ref="planQuestion" aria-label="方案关联问题"></select></label><label>研究方法<select data-ref="planMethod" aria-label="方案研究方法"><option value="">尚未确定（先澄清）</option><option value="computational">计算研究</option><option value="theoretical">理论研究</option><option value="experimental">实验研究设计（仅规划）</option></select></label><p class="muted small">领域不决定方法。此处只准备可编辑请求，发送后才生成草案，不执行实验。</p><button type="button" class="btn btn-secondary" data-ref="preparePlan">准备生成方案请求</button><button type="button" class="ch-text-button" data-ref="cancelPlan">取消方案请求</button><p role="status" data-ref="planPending"></p>';
@@ -1044,7 +1109,7 @@
         const v=g.v={root,r,pid:projectId,cid:conversationId,meta:null,material:null,messages:[],requests:{},paperIds:[],suggestions:[],suggestionOffset:null,before:null,reads:new AbortController(),busy:false,remoteBusy:false,writable:false,accepted:new Set(),tasks:{},taskTimer:null};
         window.SRA_TEACHING?.attach({v,E,button,current,request,app:g.app,refreshMessages:()=>pageMessages(v,{replace:true}),refreshMaterials:()=>refreshMaterials(v),repaint:()=>paintMessages(v),openMaterial:(kind,id)=>openMaterial(v,kind,id),adopt:sid=>adopt(v,sid),closeMaterials:()=>panel(v,false),notice,fail});
         const taskBox=E("div","ch-task-box");taskBox.dataset.ref="taskBox";taskBox.hidden=true;taskBox.setAttribute("role","status");taskBox.setAttribute("aria-label","文献检索任务");r.messages.append(taskBox);r.taskBox=taskBox;
-        const draft=store.get(draftKey(v),{});v.domainConfirmed=draft.domainConfirmed===true;v.selectedItemId=draft.selectedItemId || null;v.planRequest=draft.planRequest || null;r.planMethod.value=draft.planMethod || "";r.input.value=draft.text || "";setSettings(v,draft.settings || {});v.startPending=!v.cid && !!store.get("sra.ch.start."+scope(v.pid,null));
+        const draft=store.get(draftKey(v),{});v.entryId=Number.isInteger(draft.entryId)&&ENTRY_PATHS[draft.entryId]?draft.entryId:null;v.domainConfirmed=draft.domainConfirmed===true;v.selectedItemId=draft.selectedItemId || null;v.planRequest=draft.planRequest || null;r.planMethod.value=draft.planMethod || "";r.input.value=draft.text || "";setSettings(v,draft.settings || {});v.startPending=!v.cid && !!store.get("sra.ch.start."+scope(v.pid,null));paintEntry(v);
         r.preparePlan.onclick=()=>preparePlanInput(v,"请为所选研究问题生成一份研究方案，具体要求：",{method:r.planMethod.value || null,question_id:r.planQuestion.value || null,supersedes_id:v.planRequest?.supersedes_id || null});
         if(v.planRequest)r.planPending.textContent="已恢复待发送的方案请求；尚未调用模型，可继续编辑。";
         r.planMethod.onchange=()=>{if(v.planRequest)v.planRequest.method=r.planMethod.value || null;saveDraft(v);};r.cancelPlan.onclick=()=>{v.planRequest=null;r.planPending.textContent="已清除附加的类型和修订信息，草稿保留；如果文字仍要求生成方案，请先修改文字再发送。";saveDraft(v);};
@@ -1053,8 +1118,9 @@
         r.input.oninput=()=>{fitInput();saveDraft(v);};fitInput();
         let composing=false;r.input.addEventListener("compositionstart",()=>{composing=true;});r.input.addEventListener("compositionend",()=>{composing=false;});
         r.input.onkeydown=e=>{if((e.ctrlKey || e.metaKey) && e.key==="Enter" && !e.isComposing && !composing && e.keyCode!==229){e.preventDefault();r.form.requestSubmit();}};
-        root.querySelectorAll("[data-entry]").forEach(b=>b.onclick=()=>{const n=Number(b.dataset.entry),text=["这是我第一次做研究，我感兴趣的方向是：","我想了解这个研究方向的现状：","我目前的研究问题是：\n想请你帮我设计或完善方案。"][n];if(r.input.value.trim()&&r.input.value.trim()!==text&&!window.confirm('输入框已有草稿，是否保留并追加这段开场提示？'))return;r.mode.value=n===0 ? "beginner" : "direct";r.stage.value=["orientation","literature","design"][n];r.input.value=r.input.value.trim()&&r.input.value.trim()!==text?r.input.value+'\n\n'+text:text;saveDraft(v);r.input.focus();});
-        for(const input of [r.mode,r.stage,r.goal])input.addEventListener("input",()=>saveDraft(v));
+        root.querySelectorAll('[data-entry]').forEach(b=>b.onclick=()=>selectEntry(v,Number(b.dataset.entry)));
+        r.entryUpload.onclick=()=>chooseFile(v);
+        for(const input of [r.mode,r.stage,r.goal])input.addEventListener('input',()=>{v.entryId=null;if(input===r.stage)v.discussionStep=({orientation:'conditions',literature:'reading',question:'question',design:'design'})[r.stage.value];paintEntry(v);saveDraft(v);});
         r.domain.onchange=()=>{v.domainConfirmed=!!r.domain.value;saveDraft(v);paintHeader(v);};
         r.belongs.onchange=()=>{if(r.belongs.value==="__more__"){r.belongs.value=v.pid || "";g.app.navigate({page:"create"});}else g.app.navigate({projectId:r.belongs.value || null,conversationId:null,page:"dashboard"});};
         r.saveSettings.onclick=()=>v.cid ? settings(v).catch(e=>fail(v,e)) : notice(v,"设置已留在当前草稿，首次发送时才创建会话并保存。");
