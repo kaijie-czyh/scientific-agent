@@ -121,7 +121,8 @@ def test_quality_is_readonly_export_consistent_and_old_reports_still_parse():
         ("budget", "一万元", "user"), ("data_access", "自有论文", "user")]
     text = render_quality(report)
     assert "材料性质与可比性审阅" in text and "300 K" in text and "四周" in text
-    assert "来源 ID：p1" in text and "计算线索" in text
+    assert "来源：A source" in text and "计算线索" in text
+    assert "p1" not in text
     old = report.model_dump(exclude={"material_review", "material_notice", "condition_details"})
     parsed = PlanQualityReport.model_validate(old)
     assert parsed.version == 1 and parsed.material_review == [] and parsed.condition_details == []
@@ -148,7 +149,7 @@ def test_real_material_draft_api_and_export_use_same_readonly_review(chat, monke
     row = report["material_review"][0]
     assert row["source_matched"] and row["quantities"] == ["2 mS/cm"]
     assert row["temperatures"] == ["300 K"] and row["evidence_type"] == "experimental"
-    assert report["evidence"][0]["location"] == "摘要（未核对全文）"
+    assert report["evidence"][0]["location"] == "摘要字段（未核对全文）"
     exported = chat.client.get(f"/api/projects/p1/conversations/{cid}/suggestions/{draft['suggestion_id']}/export")
     assert exported.status_code == 200
     assert "材料性质与可比性审阅" in exported.text and "2 mS/cm" in exported.text

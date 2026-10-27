@@ -46,7 +46,7 @@ def test_abstract_draft_exposes_reading_scope_conditions_and_project_ownership(c
     assert report["status"] == "needs_attention"
     assert report["pending_conditions"] == ["资源／设备", "期限", "预算", "资料权限"]
     assert report["evidence"][0]["matched"] is True
-    assert report["evidence"][0]["location"] == "摘要（未核对全文）"
+    assert report["evidence"][0]["location"] == "摘要字段（未核对全文）"
     assert report["evidence"][0]["page"] is None
     assert any(c["code"] == "reading_scope" for c in report["checks"])
     assert quality(chat, pid="p2", conversation_id=cid, suggestion_id=draft["suggestion_id"]).status_code == 404
@@ -69,11 +69,11 @@ def test_formal_quality_tracks_corrected_sources_and_exports_same_checks(chat):
                                               text="Not scientific evidence", page=4)])
     before = tree(chat.root)
     report = answer(quality(chat, item_id=item["item_id"]))
-    assert report["evidence"][0]["location"] == "正文片段（第 4 页）"
+    assert report["evidence"][0]["location"] == "已存片段（第 4 页；未核对全文）；阅读范围未声明"
     assert report["evidence"][0]["page"] == 4
     exported = chat.client.get(f"/api/projects/p1/exports/items/{item['item_id']}")
     assert exported.status_code == 200
-    assert "交付检查（依据当前资料）" in exported.text and "正文片段（第 4 页）" in exported.text
+    assert "交付检查（依据当前资料）" in exported.text and "已存片段（第 4 页；未核对全文）；阅读范围未声明" in exported.text
     assert tree(chat.root) == before
     paper = service.store.list_papers()[0]
     paper.abstract = "Corrected abstract"
@@ -115,7 +115,7 @@ def test_fulltext_match_is_only_ready_for_discussion_not_scientific_approval(cha
                                         text="Not scientific evidence", page=None)]}
     report = assess_plan(plan, {paper.paper_id: paper}, chunks, target_id="draft", workspace_revision=2)
     assert report.status == "ready_for_discussion" and "专业审阅" in report.label
-    assert report.evidence[0].location == "正文片段（未标页码）" and report.evidence[0].page is None
+    assert report.evidence[0].location == "已存片段（未标页码；未核对全文）；阅读范围未声明" and report.evidence[0].page is None
     assert "不证明引文支持论断" in report.notice
     assert not hasattr(report, "score")
     missing = assess_plan(plan, {}, {}, target_id="draft", workspace_revision=2)

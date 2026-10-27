@@ -601,12 +601,16 @@ class WorkspaceService:
         }
 
     def export_markdown(self) -> str:
+        from core.workspace.plans import METHODS, export_plan_content
+
         workspace = self.load()
         papers = {p.paper_id: p for p in self.store.list_papers()}
+        records = {i.item_id: i for i in workspace.items}
+        name = self.store.get_kv("project.display_name", "") or self.store.get_kv("research.topic", "未命名研究项目")
         lines = [
             "# 科研工作台记录",
             "",
-            f"项目：{self.project_id} · 版本：{workspace.revision}",
+            f"项目：{name} · 材料版本：{workspace.revision}",
             "",
         ]
         flow = self.workflow(workspace)["flow"]
@@ -632,21 +636,21 @@ class WorkspaceService:
                     "",
                     f"## {KIND_LABELS[item.kind]}：{item.title}",
                     "",
-                    f"记录 ID：{item.item_id} · 状态：{item.status} · 需要复核：{item.needs_review}",
+                    f"状态：{'当前记录' if item.status == 'active' else '已被修订的历史记录'} · {'待复核' if item.needs_review else '未发现资料变更'}",
                     "",
-                    item.content,
+                    export_plan_content(item, {pid: str(n) for n, pid in enumerate(item.paper_ids, 1)}),
                 ]
             )
             if item.kind == "plan":
                 lines.extend(
                     [
                         "",
-                        f"方案版本：{item.plan_version if item.plan_version is not None else '历史记录，未标版'}；修订自：{item.supersedes_id or '无'}",
+                        f"方案版本：{item.plan_version if item.plan_version is not None else '历史记录，未标版'}；修订自：{records[item.supersedes_id].title if item.supersedes_id in records else '历史记录已不可用' if item.supersedes_id else '无'}",
                     ]
                 )
                 if item.plan:
                     lines.append(
-                        f"方案类型：{item.plan.method}；模板：{item.plan.template_version}；关联问题：{item.plan.question_id}"
+                        f"方案类型：{METHODS[item.plan.method]}；关联问题：{records[item.plan.question_id].title if item.plan.question_id in records else '待核对'}"
                     )
             if item.result_status:
                 lines.extend(
@@ -659,17 +663,17 @@ class WorkspaceService:
             if item.assessment:
                 lines.extend(["", f"用户判断（未经系统独立验证）：{item.assessment}"])
             if item.related_ids:
-                lines.extend(["", "关联记录：" + "、".join(item.related_ids)])
+                lines.extend(["", "关联记录：" + "、".join(records[rid].title if rid in records else "记录已不可用" for rid in item.related_ids)])
             if item.source_ref:
                 lines.extend(
                     [
                         "",
-                        f"来源材料：{item.source_ref.kind} / {item.source_ref.source_id}；指纹：{item.source_ref.fingerprint}",
+                        "来源材料：已关联的项目资料；保留原始记录状态。",
                     ]
                 )
-            for pid in item.paper_ids:
+            for n, pid in enumerate(item.paper_ids, 1):
                 p = papers.get(pid)
                 lines.append(
-                    f"\n来源：{p.title if p else pid}（{pid}；DOI：{p.doi if p else '未知'}）"
+                    f"\n[{n}] 来源：{p.title if p else '来源未找到，请核对项目资料'}；DOI：{p.doi if p and p.doi else '未提供'}"
                 )
         return "\n".join(lines)

@@ -3435,8 +3435,7 @@ _PDF_GLYPH_MAP = {
 
 def _pdf_safe_text(text: str) -> str:
     """pdf 文本安全化：去除不可打印控制符，替换中文字体缺失的符号字形，
-    保留完整内容；连续无空格长串（URL / 代码）按 40 字符插空格，
-    防止 fpdf2 抛 'Not enough horizontal space to render a single character'。"""
+    保留完整内容与原有空格；长 URL、化学式与中文由 PDF 排版器换行。"""
     if text is None:
         return ""
     # 替换缺失字形（先做，避免 emoji 变体选择符干扰）
@@ -3444,21 +3443,7 @@ def _pdf_safe_text(text: str) -> str:
         if src in text:
             text = text.replace(src, dst)
     # 保留常见标点与中文，剥离控制字符（\x00-\x1f 等）
-    safe = "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
-    # 给超过 40 字符的无空格连续串插入空格，便于 word wrap
-    out = []
-    span = 0
-    for ch in safe:
-        if ch.isspace():
-            span = 0
-            out.append(ch)
-            continue
-        span += 1
-        if span > 40:
-            out.append(" ")
-            span = 1
-        out.append(ch)
-    return "".join(out)
+    return "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
 
 
 def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
@@ -3470,9 +3455,26 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
     """
     import io
     from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
+    from fpdf.enums import MethodReturnValue, XPos, YPos
 
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    class DeliveryPDF(FPDF):
+        def set_font(self, family=None, style="", size=0):
+            super().set_font(family, style, size)
+            if self.page and self.font_family:
+                # fpdf2 can select a CJK fallback inside q/Q yet mark the primary
+                # font as globally selected, dropping subsequent ASCII. Public
+                # text("") emits its font selection without adding text or moving.
+                self.text(self.x, self.y, "")
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font(font_name, size=8)
+            self.set_text_color(105, 115, 125)
+            self.cell(0, 4, f"{self.page_no()} / {{nb}}", align="C")
+
+    pdf = DeliveryPDF(orientation="P", unit="mm", format="A4")
+    pdf.alias_nb_pages()
+    pdf.set_margins(16, 16, 16)
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
 
@@ -3501,13 +3503,15 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
         # 兜底：用内置字体（不支持中文，但不会崩溃）
         font_name = "Helvetica"
 
-    # SimHei lacks scientific superscripts/subscripts; keep their actual glyphs.
+    # Segoe keeps proportional Latin/formulas; the CJK font supplies Chinese glyphs.
     scientific_font = "C:/Windows/Fonts/segoeui.ttf"
     if os.path.isfile(scientific_font):
         pdf.add_font("scientific", "", scientific_font)
         scientific_bold = "C:/Windows/Fonts/segoeuib.ttf"
         pdf.add_font("scientific", "B", scientific_bold if os.path.isfile(scientific_bold) else scientific_font)
-        pdf.set_fallback_fonts(["scientific"])
+        if font_loaded:
+            pdf.set_fallback_fonts([font_name])
+        font_name = "scientific"
 
     pdf.set_font(font_name, size=11)
 
@@ -3525,7 +3529,7 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
         if in_code_block:
             pdf.set_font(font_name, size=8)
             # Character wrapping preserves full code without overflowing the page.
-            pdf.multi_cell(0, 5, _pdf_safe_text(stripped), wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 5, _pdf_safe_text(stripped), align="L", wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
             i += 1
             continue
@@ -3542,33 +3546,38 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
             pdf.ln(2)
             continue
 
-        if stripped.startswith("### "):
-            pdf.set_font(font_name, size=13)
-            pdf.ln(3)
-            pdf.multi_cell(0, 7, _pdf_safe_text(_md_strip_inline(stripped[4:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.set_font(font_name, size=11)
-        elif stripped.startswith("## "):
-            pdf.set_font(font_name, size=15)
-            pdf.ln(5)
-            pdf.multi_cell(0, 8, _pdf_safe_text(_md_strip_inline(stripped[3:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.set_font(font_name, size=11)
-        elif stripped.startswith("# "):
-            pdf.set_font(font_name, size=18)
-            pdf.ln(8)
-            pdf.multi_cell(0, 10, _pdf_safe_text(_md_strip_inline(stripped[2:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        wrapmode = "CHAR" if re.search(r"[\u3400-\u9fff]", stripped) else "WORD"
+        heading = re.match(r"^(#{1,3})\s+(.+)$", stripped)
+        if heading:
+            level = len(heading.group(1))
+            size, line_height, before = {1: (18, 9, 6), 2: (14, 7, 4), 3: (12, 6, 3)}[level]
+            title = _pdf_safe_text(_md_strip_inline(heading.group(2)))
+            pdf.set_font(font_name, style="B", size=size)
+            height = pdf.multi_cell(0, line_height, title, align="L", wrapmode=wrapmode, dry_run=True,
+                                    output=MethodReturnValue.HEIGHT)
+            # Keep the heading with at least two body lines, including paragraph spacing.
+            if pdf.will_page_break(before + height + 18):
+                pdf.add_page()
+            if pdf.get_y() > pdf.t_margin + 1:
+                pdf.ln(before)
+            pdf.set_text_color(31, 50, 66)
+            pdf.multi_cell(0, line_height, title, align="L", wrapmode=wrapmode, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(2 if level < 3 else 1)
+            pdf.set_text_color(0)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("---"):
             pdf.ln(3)
-            pdf.multi_cell(0, 5, "=" * 60, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(2)
+            pdf.set_draw_color(205, 214, 222)
+            pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+            pdf.ln(4)
         elif stripped.startswith("> "):
             pdf.set_font(font_name, size=10)
-            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped[2:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped[2:])), align="L", wrapmode=wrapmode, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            pdf.multi_cell(0, 6, f"  \u2013 {_pdf_safe_text(_md_strip_inline(stripped[2:]))}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 6, f"- {_pdf_safe_text(_md_strip_inline(stripped[2:]))}", align="L", wrapmode=wrapmode, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         elif stripped:
-            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped)), align="L", wrapmode=wrapmode, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.ln(3)
         i += 1
@@ -3588,7 +3597,7 @@ def _draw_pdf_table(pdf: Any, font_name: str, header: list[str], rows: list[list
     列宽按页面有效宽度均分；单元格文本过 _pdf_safe_text 防超宽字符抛异常；
     表头自动加粗（fpdf2 默认 heading 行为）。
     """
-    from fpdf import FPDF  # noqa: F401
+    from fpdf.fonts import FontFace
 
     ncols = max(len(header), 1)
     # 有效页面宽度均分到各列
@@ -3597,7 +3606,9 @@ def _draw_pdf_table(pdf: Any, font_name: str, header: list[str], rows: list[list
 
     pdf.set_font(font_name, size=9)
     try:
-        with pdf.table(col_widths=col_widths, text_align="LEFT") as table:
+        with pdf.table(col_widths=col_widths, text_align="LEFT", v_align="TOP",
+                       line_height=5, padding=(1.5, 2),
+                       headings_style=FontFace(emphasis="B", fill_color=(238, 242, 246))) as table:
             # 表头行
             head_row = table.row()
             for j in range(ncols):
