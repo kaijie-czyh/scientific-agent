@@ -24,10 +24,14 @@ python -m pytest tests/test_product_plan_boundary.py tests/test_project_conversa
 | 运行配置只读检查、凭据保护与本地模型注册 | test_runtime_readiness.py、test_llm_registry.py |
 | 模型异常安全分类、API 与导出隐私、历史诊断读取 | test_research_error_privacy.py |
 | 排队领取、并发补跑与后台启动失败恢复 | test_research_retry_reliability.py、test_research_tasks.py |
+| 草稿从生成切普通讨论、显式重新生成 | test_plan_discussion_intent.py、test_conversation_product.js |
+| 实际 PDF 长文、表格与科学单位保真 | test_pdf_delivery_fidelity.py |
 | 离线教学与进度 | test_research_teaching_cases.py、test_teaching_experience.py |
 | 文献计数与检索审计展示 | test_navigation_counts.py、test_library_audit_refresh.py |
 
 前端讨论准备、草稿保留、检查刷新失败与配置提示行为可用 `node tests/test_conversation_product.js` 验证，无额外依赖；布局和原生对话框仍需实际浏览器走查。
+
+PDF 字节验证需要 Poppler `pdftotext` 位于 PATH；缺少时对应提取用例会明确跳过。科学字形回退用例验证 Windows Segoe UI 字体；缺少该字体会跳过，不能将跳过视为跨平台字体已验证。
 
 完整测试集还包含保留的内部历史架构测试。内部完整流水线不是网页产品开放能力，不能根据测试名称认为产品会运行实验或生成论文。
 

@@ -3433,9 +3433,9 @@ _PDF_GLYPH_MAP = {
 }
 
 
-def _pdf_safe_text(text: str, max_chars: int = 100) -> str:
+def _pdf_safe_text(text: str) -> str:
     """pdf 文本安全化：去除不可打印控制符，替换中文字体缺失的符号字形，
-    超长行按字符截断；连续无空格长串（URL / 代码）按 40 字符插空格，
+    保留完整内容；连续无空格长串（URL / 代码）按 40 字符插空格，
     防止 fpdf2 抛 'Not enough horizontal space to render a single character'。"""
     if text is None:
         return ""
@@ -3458,10 +3458,7 @@ def _pdf_safe_text(text: str, max_chars: int = 100) -> str:
             out.append(" ")
             span = 1
         out.append(ch)
-    safe = "".join(out)
-    if len(safe) > max_chars:
-        safe = safe[:max_chars] + "..."
-    return safe
+    return "".join(out)
 
 
 def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
@@ -3504,6 +3501,14 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
         # 兜底：用内置字体（不支持中文，但不会崩溃）
         font_name = "Helvetica"
 
+    # SimHei lacks scientific superscripts/subscripts; keep their actual glyphs.
+    scientific_font = "C:/Windows/Fonts/segoeui.ttf"
+    if os.path.isfile(scientific_font):
+        pdf.add_font("scientific", "", scientific_font)
+        scientific_bold = "C:/Windows/Fonts/segoeuib.ttf"
+        pdf.add_font("scientific", "B", scientific_bold if os.path.isfile(scientific_bold) else scientific_font)
+        pdf.set_fallback_fonts(["scientific"])
+
     pdf.set_font(font_name, size=11)
 
     lines = md_content.split("\n")
@@ -3519,9 +3524,8 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
             continue
         if in_code_block:
             pdf.set_font(font_name, size=8)
-            # 代码块：超长行按 80 字符截断 + 字符换行（wrapmode=CHAR），
-            # 防止 fpdf2 遇到超宽单词抛 "Not enough horizontal space"
-            pdf.multi_cell(0, 5, _pdf_safe_text(stripped, 80), wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            # Character wrapping preserves full code without overflowing the page.
+            pdf.multi_cell(0, 5, _pdf_safe_text(stripped), wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
             i += 1
             continue
@@ -3592,17 +3596,22 @@ def _draw_pdf_table(pdf: Any, font_name: str, header: list[str], rows: list[list
     col_widths = tuple(usable / ncols for _ in range(ncols))
 
     pdf.set_font(font_name, size=9)
-    with pdf.table(col_widths=col_widths, text_align="LEFT") as table:
-        # 表头行
-        head_row = table.row()
-        for j in range(ncols):
-            head_row.cell(_pdf_safe_text(header[j] if j < len(header) else "", 200))
-        # 数据行
-        for row in rows:
-            data_row = table.row()
+    try:
+        with pdf.table(col_widths=col_widths, text_align="LEFT") as table:
+            # 表头行
+            head_row = table.row()
             for j in range(ncols):
-                cell_text = row[j] if j < len(row) else ""
-                data_row.cell(_pdf_safe_text(cell_text, 400))
+                head_row.cell(_pdf_safe_text(header[j] if j < len(header) else ""))
+            # 数据行
+            for row in rows:
+                data_row = table.row()
+                for j in range(ncols):
+                    cell_text = row[j] if j < len(row) else ""
+                    data_row.cell(_pdf_safe_text(cell_text))
+    except ValueError as exc:
+        if "too high" not in str(exc):
+            raise
+        raise HTTPException(422, "表格单行超过 PDF 页面高度，未截断内容。请下载 Markdown 或 DOCX 获取完整材料。") from exc
     pdf.set_font(font_name, size=11)
 
 
